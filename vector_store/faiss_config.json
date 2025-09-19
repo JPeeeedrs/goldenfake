@@ -1,0 +1,7 @@
+{
+  "model_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "dim": 384,
+  "normalize": true,
+  "index_type": "IndexFlatIP",
+  "count": 3600
+}

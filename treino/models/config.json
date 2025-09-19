@@ -1,0 +1,15 @@
+{
+  "embed_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "normalize": true,
+  "debias": "both",
+  "protected_mode": "auto",
+  "entity_types": [
+    "PERSON",
+    "ORG",
+    "GPE"
+  ],
+  "protected_terms_file": "debias_config.json",
+  "spacy": true,
+  "style_features": true,
+  "style_feature_count": 8
+}
