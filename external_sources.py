@@ -459,14 +459,17 @@ def _source_tags(url: str, publisher: str | None, rating: str | None) -> List[st
     return sorted(tags)
 
 
-
 def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sbert: SentenceTransformer,
-                                   sim_threshold: float = 0.25, topk: int = 3) -> Tuple[float, List[Dict[str, Any]]]:
+                                   sim_threshold: float = 0.25, topk: int = 10) -> Tuple[float, List[Dict[str, Any]]]:
     """Retorna (score_claim, detalhes_topk).
     Regras de overlap:
       - ov >= 0.50: peso total (factor=1.0)
       - 0.40 <= ov < 0.50: penaliza (factor=0.95)
       - ov < 0.40: peso bem baixo (factor=0.85)
+
+    Cálculo de score final por fontes externas: média das 10 primeiras evidências (padding implícito).
+    Mesmo que haja menos de 10 evidências, a soma é dividida por 10.
+    Limite rígido: o número de evidências usadas na base do cálculo não pode exceder 10.
     """
     scored = []
     for r in results:
@@ -527,15 +530,32 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
     # filtrar apenas por similaridade mínima (overlap agora ajusta peso, não exclui)
     scored = [x for x in scored if x["similaridade"] >= sim_threshold]
     scored.sort(key=lambda x: x["score"], reverse=True)
+
+    # Impõe limite rígido de 10 evidências no cálculo, independentemente do valor recebido em topk
+    max_base = 10
+    try:
+        topk = int(topk)
+    except Exception:
+        topk = max_base
+    topk = min(max_base, max(0, topk))
+
     top = scored[:topk]
+    # Média das 10 primeiras evidências; se houver menos de 10, dividir por 10 mesmo assim (padding zero)
     if not top:
         return 0.0, []
-    return float(top[0]["score"]) * 100.0, top
+    sum_top_scores = float(sum(it.get("score", 0.0) for it in top))  # score está em [0,1]
+    avg_top10_pct = (sum_top_scores / 10.0) * 100.0
+    return avg_top10_pct, top
 
 
 def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple[float, List[Dict[str, Any]]]:
     """Calcula fonte_score (0-100) e retorna detalhes por afirmação.
     Integra Google Fact Check, NewsAPI e, opcionalmente, SerpAPI/Bing para busca geral.
+
+    Regra de pontuação global:
+    - O score final (fonte_score) é a média dos TOP 10 resultados globais considerando TODAS as afirmações (padding zero),
+      isto é, soma dos scores dos 10 melhores resultados dividida por 10, multiplicada por 100.
+      Dessa forma, o denominador é sempre 10, independente de quantos sites forem encontrados.
     """
     claims = extract_claims(text)
 
@@ -547,6 +567,8 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
 
     details_all: List[Dict[str, Any]] = []
     per_claim_scores: List[float] = []
+    # Acumular evidências globalmente para cálculo do TOP 10 geral
+    global_evidences: List[Dict[str, Any]] = []
 
     for c in claims:
         results: List[Dict[str, Any]] = []
@@ -574,8 +596,19 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
             "score_afirmacao": round(score_c, 1),
             "evidencias": top,
         })
+        # Acumular para ranking global
+        if top:
+            global_evidences.extend(top)
         # Evitar rate limits agressivos
         time.sleep(0.3)
 
-    fonte_score = float(np.mean(per_claim_scores)) if per_claim_scores else 0.0
+    # Cálculo do score final com divisor fixo 10 (TOP 10 global)
+    if global_evidences:
+        global_evidences.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        top10_global = global_evidences[:10]
+        sum_scores = float(sum(it.get("score", 0.0) for it in top10_global))  # scores em [0,1]
+        fonte_score = (sum_scores / 10.0) * 100.0
+    else:
+        fonte_score = 0.0
+
     return fonte_score, details_all

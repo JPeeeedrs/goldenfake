@@ -4,6 +4,60 @@ const fmt = (v) =>
 		? "--"
 		: Math.round(v * 10) / 10 + "%";
 
+// --- Pie chart (Chart.js) support ---
+let pieChartInstance = null;
+const pieColors = ["#0ea5e9", "#22c55e", "#f59e0b"]; // 3 cores (Histórico, BERT, Fontes)
+
+function ensurePieCtx() {
+	const canvas = el("pieChart");
+	const fallback = el("pieFallback");
+	if (!canvas) return null;
+	if (typeof window.Chart === "undefined") {
+		if (fallback) fallback.style.display = "block";
+		canvas.style.display = "none";
+		return null;
+	}
+	if (fallback) fallback.style.display = "none";
+	canvas.style.display = "block";
+	const ctx = canvas.getContext("2d");
+	return ctx;
+}
+
+function updatePieChart(h, b, f) {
+	const values = [h, b, f].map((v) =>
+		typeof v === "number" && isFinite(v) ? v : 0
+	);
+	const ctx = ensurePieCtx();
+	if (!ctx) return;
+	if (!pieChartInstance) {
+		pieChartInstance = new Chart(ctx, {
+			type: "pie",
+			data: {
+				labels: ["Histórico", "BERT", "Fontes"],
+				datasets: [
+					{
+						data: values,
+						backgroundColor: pieColors,
+						borderWidth: 0,
+					},
+				],
+			},
+			options: {
+				responsive: true,
+				maintainAspectRatio: false,
+				plugins: {
+					legend: { position: "bottom" },
+				},
+			},
+		});
+	} else {
+		pieChartInstance.data.labels = ["Histórico", "BERT", "Fontes"];
+		pieChartInstance.data.datasets[0].data = values;
+		pieChartInstance.data.datasets[0].backgroundColor = pieColors;
+		pieChartInstance.update();
+	}
+}
+
 function paint(idBar, idPct, idStatus, val) {
 	el(idPct).textContent = fmt(val);
 	el(idBar).style.width = (val || 0) + "%";
@@ -47,7 +101,8 @@ function renderSources(list) {
 		card.style.display = "none";
 		return;
 	}
-	list.forEach((item) => {
+	// Limit to top 10 items for display
+	list.slice(0, 10).forEach((item) => {
 		const row = document.createElement("div");
 		row.className = "source-item";
 		const left = document.createElement("div");
@@ -150,6 +205,8 @@ document.addEventListener("DOMContentLoaded", () => {
 				paint("barBert", "pctBert", "stBert", b);
 				paint("barFontes", "pctFontes", "stFontes", f);
 				paint("barFinal", "pctFinal", "stFinal", fin);
+				// Atualiza gráfico de pizza (apenas 3 fatias)
+				updatePieChart(h, b, f);
 				el("out").textContent = JSON.stringify(json, null, 2);
 				const fontes = json.confirmacao_fontes?.fontes_individuais || [];
 				renderSources(fontes);

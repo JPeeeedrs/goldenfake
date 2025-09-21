@@ -118,6 +118,16 @@
                 definidos. Use como indicação inicial, não veredicto definitivo.</p>
         </div>
 
+        <div class="card" id="chartCard">
+            <h2 style="margin:0 0 .75rem; font-size:1.05rem;">Gráfico de pizza das porcentagens</h2>
+            <div class="chart-wrap">
+                <canvas id="pieChart"></canvas>
+            </div>
+            <div id="pieFallback" class="small" style="display:none;color:#64748b;">
+                Não foi possível carregar o gráfico.
+            </div>
+        </div>
+
         <div class="card" id="sourcesCard" style="display:none;">
             <h2 style="margin:0 0 .75rem; font-size:1.05rem;">Fontes externas (individuais)</h2>
             <div class="small">Percentual final por evidência considerada. Clique no título para abrir.</div>
@@ -133,6 +143,7 @@
         <pre id="out">{}</pre>
     </div>
 
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="script.js"></script>
 </body>
 

@@ -1,5 +1,9 @@
 /* Layout fix: ensure padding/border are included in width to avoid overflow */
-* , *::before, *::after { box-sizing: border-box; }
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
 
 :root {
 	--c-bg: #f5f7fa;
@@ -237,4 +241,18 @@ a.inline:hover {
 .badge.fc {
 	background: #dcfce7;
 	color: #166534;
+}
+
+/* Pie chart container sizing to prevent infinite growth */
+.chart-wrap {
+	position: relative;
+	width: 100%;
+	max-width: 420px;
+	height: 320px; /* fixed height for stability */
+	margin: 0 auto;
+}
+#pieChart {
+	display: block; /* remove inline gap */
+	width: 100% !important;
+	height: 100% !important;
 }
