@@ -70,6 +70,12 @@ TRUSTED_DOMAINS = {
     "veja.abril.com.br": 0.8,
 }
 
+# Penalização para redes sociais: reduzir confiança de fontes como Instagram, X/Twitter, Facebook, Pinterest, Bluesky, Threads
+SOCIAL_DOMAINS = {
+    "instagram.com", "x.com", "twitter.com", "facebook.com", "fb.com", "pinterest.com", "bsky.app", "bsky.social", "threads.net",
+}
+SOCIAL_PUBLISHER_NAMES = {"instagram", "x", "twitter", "facebook", "pinterest", "bluesky", "threads"}
+
 
 def _get_domain(url: str) -> str:
     try:
@@ -88,7 +94,34 @@ def _domain_weight(url: str) -> float:
     for known, w in TRUSTED_DOMAINS.items():
         if d == known or d.endswith("." + known):
             return float(w)
+    # Heurísticas para domínios acadêmicos e governamentais
+    try:
+        if d.endswith(".gov") or d.endswith(".gov.br"):
+            return 0.95
+        if d.endswith(".edu") or d.endswith(".edu.br") or ".ac." in d:
+            return 0.9
+        # Universidades BR comuns (usp, unicamp, unesp, e UF*)
+        if re.search(r"(^|\.)((usp|unicamp|unesp|uf[a-z]{1,3}|ufrj|ufmg|ufba|ufms|ufpb|ufpr|ufsc|ufrn))(\.|$)", d):
+            return 0.9
+    except Exception:
+        pass
     return 0.5  # neutro quando desconhecido
+
+
+def _is_social_source(url: str, publisher: str | None) -> bool:
+    d = _get_domain(url)
+    if d:
+        for sd in SOCIAL_DOMAINS:
+            if d == sd or d.endswith("." + sd):
+                return True
+    if publisher:
+        p = publisher.strip().lower()
+        # normalizar caracteres comuns
+        p = re.sub(r"[^a-z0-9]+", " ", p)
+        tokens = set(p.split())
+        if tokens & SOCIAL_PUBLISHER_NAMES:
+            return True
+    return False
 
 
 def extract_claims(text: str, max_claims: int = 3) -> List[str]:
@@ -303,6 +336,39 @@ RATING_MAP = {
     "false": 0.0,
 }
 
+# Stopwords básicas PT/EN para evitar contar palavras funcionais
+STOPWORDS = {
+    # pt
+    "a","o","as","os","um","uma","uns","umas","de","do","da","dos","das","e","em","no","na","nos","nas","por","para","com","sem","sobre","entre","até","após","antes","como","que","se","sua","seu","suas","seus","é","foi","ser","são","era","ao","à","às","aos","mais","menos","muito","muita","muitas","muitos","já","não","sim","também","ou","onde","quando","porque","porquê","qual","quais","qualquer","toda","todo","todas","todos","há","teve","ter","tem","têm","desde","contra","meu","minha","meus","minhas",
+    # en
+    "the","a","an","and","or","of","in","on","for","to","from","by","with","without","as","at","that","this","these","those","is","are","was","were","be","been","being","it","its","into","their","there","here","not","yes","no","also","any","all","more","less",
+}
+
+def _tokenize(text: str) -> List[str]:
+    if not text:
+        return []
+    # Captura palavras com letras latinas e números; normaliza para minúsculas
+    tokens = re.findall(r"[\wÀ-ÿ]+", text.lower())
+    out: List[str] = []
+    for t in tokens:
+        if t in STOPWORDS:
+            continue
+        if t.isdigit():
+            continue
+        if len(t) < 3:
+            continue
+        out.append(t)
+    return out
+
+
+def _overlap_ratio(a: str, b: str) -> float:
+    ta = set(_tokenize(a))
+    if not ta:
+        return 0.0
+    tb = set(_tokenize(b))
+    inter = ta & tb
+    return len(inter) / max(1, len(ta))
+
 
 def _rating_to_score(text: str | None) -> float:
     if not text:
@@ -318,28 +384,147 @@ def _rating_to_score(text: str | None) -> float:
     return 0.5
 
 
+# Amortecedor global para reduzir a influência do score de fontes externas
+EXTERNAL_SCORE_SCALE = 1.0
+
+# Lista de domínios de notícias comuns para classificar rapidamente
+NEWS_DOMAINS = {
+    "g1.globo.com", "bbc.com", "bbc.co.uk", "uol.com.br", "folha.uol.com.br", "estadao.com.br",
+    "cnn.com", "cnnbrasil.com.br", "nytimes.com", "washingtonpost.com", "reuters.com", "apnews.com",
+    "elpais.com", "dw.com", "r7.com", "terra.com.br", "oglobo.globo.com", "gazetadopovo.com.br",
+}
+
+BLOG_DOMAINS = {"medium.com", "blogspot.com", "wordpress.com", "substack.com"}
+FORUM_DOMAINS = {"reddit.com", "quora.com", "stackexchange.com", "stackoverflow.com"}
+VIDEO_DOMAINS = {"youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com"}
+WIKI_DOMAINS = {"wikipedia.org", "wikinews.org", "wikiversity.org", "wikibooks.org"}
+PR_DOMAINS = {"prnewswire.com", "businesswire.com", "globenewswire.com"}
+
+
+def _has_path_blog(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return "/blog" in (p.path or "").lower()
+    except Exception:
+        return False
+
+
+def _source_tags(url: str, publisher: str | None, rating: str | None) -> List[str]:
+    tags = set()
+    d = _get_domain(url)
+    pub = (publisher or "").lower().strip()
+
+    # fact-check
+    if rating and isinstance(rating, str):
+        if "fact-check" in rating.lower() or rating.lower() in RATING_MAP or any(fc in (url or "").lower() for fc in FACT_CHECK_DOMAINS.keys()):
+            tags.add("fact-check")
+    else:
+        for fc in FACT_CHECK_DOMAINS.keys():
+            if fc in (url or "").lower():
+                tags.add("fact-check")
+                break
+
+    # social
+    if _is_social_source(url, publisher):
+        tags.add("social")
+
+    # gov/academic/wiki/video/forum/blog/news/pr
+    if d:
+        if d.endswith(".gov") or d.endswith(".gov.br"):
+            tags.add("gov")
+        if d.endswith(".edu") or d.endswith(".edu.br") or ".ac." in d:
+            tags.add("academic")
+        if any(d == w or d.endswith("." + w) for w in WIKI_DOMAINS):
+            tags.add("wiki")
+        if any(d == v or d.endswith("." + v) for v in VIDEO_DOMAINS):
+            tags.add("video")
+        if any(d == f or d.endswith("." + f) for f in FORUM_DOMAINS):
+            tags.add("forum")
+        if any(d == b or d.endswith("." + b) for b in BLOG_DOMAINS) or _has_path_blog(url) or "blog" in pub:
+            tags.add("blog")
+        if any(d == n or d.endswith("." + n) for n in NEWS_DOMAINS) or "noticias" in d or "news" in d or "globo.com" in d:
+            tags.add("news")
+        if any(d == pr or d.endswith("." + pr) for pr in PR_DOMAINS):
+            tags.add("press-release")
+
+    # publisher heuristics
+    if pub:
+        if "universidade" in pub or "universidad" in pub or "university" in pub:
+            tags.add("academic")
+        if "minist" in pub or "prefeitura" in pub or "governo" in pub or "gov" == pub:
+            tags.add("gov")
+        if "noticias" in pub or "news" in pub or "jornal" in pub:
+            tags.add("news")
+
+    return sorted(tags)
+
+
+
 def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sbert: SentenceTransformer,
-                                   sim_threshold: float = 0.3, topk: int = 3) -> Tuple[float, List[Dict[str, Any]]]:
-    """Retorna (score_claim, detalhes_topk)."""
+                                   sim_threshold: float = 0.25, topk: int = 3) -> Tuple[float, List[Dict[str, Any]]]:
+    """Retorna (score_claim, detalhes_topk).
+    Regras de overlap:
+      - ov >= 0.50: peso total (factor=1.0)
+      - 0.40 <= ov < 0.50: penaliza (factor=0.95)
+      - ov < 0.40: peso bem baixo (factor=0.85)
+    """
     scored = []
     for r in results:
         ref_text = r.get("claim_text") or r.get("title") or ""
         sim = _cosine_sim(sbert, claim, ref_text) if ref_text else 0.0
         base_score = _rating_to_score(r.get("rating"))
-        trust = _domain_weight(r.get("url") or "")
-        # Se há rating (artigo de checagem), dar mais peso ao rating; caso contrário, dar mais peso à similaridade+confiança
-        if r.get("rating"):
-            comb = 0.6 * base_score + 0.3 * max(sim, 0.0) + 0.1 * trust
+        # calcular confiança do domínio e aplicar penalização se for rede social
+        url = r.get("url") or ""
+        publisher = r.get("publisher") or ""
+        trust = _domain_weight(url)
+        social = _is_social_source(url, publisher)
+        if social:
+            trust = min(trust, 0.2)  # reduzir confiança para fontes de redes sociais
+        # Overlap de palavras entre a afirmação e o texto da evidência
+        ov = _overlap_ratio(claim, ref_text)
+        if ov >= 0.50:
+            ov_factor = 1.0
+            ov_bucket = ">=50%"
+            pass50 = True
+            pass40 = True
+        elif ov >= 0.40:
+            ov_factor = 0.95  # mais brando
+            ov_bucket = "40-49%"
+            pass50 = False
+            pass40 = True
         else:
-            comb = 0.6 * max(sim, 0.0) + 0.4 * trust
+            ov_factor = 0.85  # mais brando
+            ov_bucket = "<40%"
+            pass50 = False
+            pass40 = False
+        # Boost baseado em confiança do domínio para fontes fortes
+        if trust >= 0.85:
+            if ov_bucket == "40-49%":
+                ov_factor = max(ov_factor, 0.95)
+            elif ov_bucket == "<40%":
+                ov_factor = max(ov_factor, 0.90)
+        # Combinação base: se há rating (fact-check), dar mais peso ao rating e à similaridade
+        if r.get("rating"):
+            comb = 0.6 * base_score + 0.25 * max(sim, 0.0) + 0.15 * trust
+        else:
+            comb = 0.45 * max(sim, 0.0) + 0.40 * trust + 0.05 * ov
+        comb_eff = comb * ov_factor
+        final_eff = comb_eff * EXTERNAL_SCORE_SCALE
         r2 = dict(r)
         r2.update({
             "similaridade": round(sim, 3),
             "confianca_fonte": round(trust, 2),
-            "score": round(comb, 3),
+            "overlap_ratio": round(ov, 3),
+            "overlap_bucket": ov_bucket,
+            "overlap_factor": round(ov_factor, 2),
+            "passes_50pct": bool(pass50),
+            "passes_40pct": bool(pass40),
+            "score": round(final_eff, 3),
+            "is_social": bool(social),
+            "source_tags": _source_tags(url, publisher, r.get("rating")),
         })
         scored.append(r2)
-    # filtrar por similaridade mínima
+    # filtrar apenas por similaridade mínima (overlap agora ajusta peso, não exclui)
     scored = [x for x in scored if x["similaridade"] >= sim_threshold]
     scored.sort(key=lambda x: x["score"], reverse=True)
     top = scored[:topk]

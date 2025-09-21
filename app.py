@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify
 import os
 import json
 import numpy as np
@@ -11,38 +11,128 @@ from fact_checker import (
     bert_probability_true_for_text,
     fuse_scores,
     classify_text,
+    load_online_adaptor,
+    combined_historical_consistency_for_text,
 )
 from external_sources import verify_with_external_sources
 
 app = Flask(__name__)
 
+# Habilitar CORS para desenvolvimento (inclui file:// como origem nula)
+try:
+    from flask_cors import CORS
+    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False, methods=["GET","POST","OPTIONS"], allow_headers=["Content-Type"], expose_headers=["Content-Type"], send_wildcard=True)
+except Exception:
+    pass
+
 # Carregar artefatos uma vez
 INDEX, METADATA, VCFG = load_vector_store()
 CLF, LE, SBERT, CCFG = load_classifier()
+ONLINE = load_online_adaptor(LE, SBERT, CCFG)
 
 DEFAULTS = {
     "k": 20,
-    "w_hist": 1/3,
-    "w_bert": 1/3,
-    "w_fontes": 1/3,
+    "w_hist": 0.5,
+    "w_bert": 0.35,
+    "w_fontes": 0.33,
     # novos padrões de chunking
     "max_tokens": 512,
     "overlap_tokens": 64,
     "hist_agg": "max",   # max ou mean
     "bert_agg": "mean",  # mean ou max
+    # Wikipedia dinâmico (opcional)
+    "use_wiki": False,
+    "wiki_titles": 3,
+    "w_faiss": 0.5,
+    "w_wiki": 0.5,
 }
 
 
+def _negative_label_from_le(le) -> str:
+    classes = list(getattr(le, "classes_", []))
+    if not classes:
+        return "false"
+    if "true" in classes and len(classes) == 2:
+        return classes[0] if classes[1] == "true" else classes[1]
+    # fallback: use first non-true
+    for c in classes:
+        if c != "true":
+            return c
+    return classes[0]
+
+
+def _as_bool(val, default=False):
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"): return True
+    if s in ("0", "false", "no", "n", "off"): return False
+    return default
+
+
+def _flatten_external_evidence(details):
+    items = []
+    seen = set()
+    for cl in details or []:
+        for ev in (cl.get("evidencias") or []):
+            url = ev.get("url") or ""
+            key = url or f"{ev.get('title') or ''}|{ev.get('publisher') or ''}"
+            if key in seen:
+                continue
+            seen.add(key)
+            sc = ev.get("score")
+            try:
+                pct = round(float(sc) * 100.0, 1)
+            except Exception:
+                continue
+            rating = ev.get("rating")
+            fc_flag = bool(ev.get("fact_checker")) or (isinstance(rating, str) and "fact-check" in rating.lower())
+            items.append({
+                "title": ev.get("title"),
+                "url": url,
+                "publisher": ev.get("publisher"),
+                "provider": ev.get("provider"),
+                "percent": pct,
+                "similaridade": ev.get("similaridade"),
+                "confianca_fonte": ev.get("confianca_fonte"),
+                "overlap_bucket": ev.get("overlap_bucket") or (
+                    ">=50%" if ev.get("passes_50pct") else ("40-49%" if ev.get("passes_40pct") else "<40%")
+                ),
+                "is_social": ev.get("is_social", False),
+                "fact_checker": fc_flag,
+                "rating": rating,
+                # include backend-generated source tags for UI badges
+                "source_tags": ev.get("source_tags") or [],
+            })
+    items.sort(key=lambda x: x.get("percent", 0), reverse=True)
+    return items
+
+
 def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_fontes: float,
-                          max_tokens: int, overlap_tokens: int, hist_agg: str, bert_agg: str):
+                          max_tokens: int, overlap_tokens: int, hist_agg: str, bert_agg: str,
+                          use_wiki: bool, wiki_titles: int, w_faiss: float, w_wiki: float):
     text = (text or "").strip()
     if not text:
         return {"error": "texto vazio"}, 400
 
-    # Consistência histórica e BERT com suporte a chunking (512 tokens por padrão)
-    hist_score, neighbors = historical_consistency_for_text(
-        INDEX, SBERT, text, k=k, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=hist_agg
-    )
+    # Consistência histórica (FAISS) ou combinação com Wikipedia
+    hist_info = {}
+    if use_wiki:
+        hist_score, hist_info = combined_historical_consistency_for_text(
+            INDEX, SBERT, text,
+            k=k,
+            max_tokens=max_tokens,
+            overlap_tokens=overlap_tokens,
+            aggregate=hist_agg,
+            wiki_titles=wiki_titles,
+            w_faiss=w_faiss,
+            w_wiki=w_wiki,
+        )
+        neighbors = hist_info.get("faiss", {}).get("vizinhos", [])
+    else:
+        hist_score, neighbors = historical_consistency_for_text(
+            INDEX, SBERT, text, k=k, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=hist_agg
+        )
 
     bert_score_true = bert_probability_true_for_text(
         CLF, LE, SBERT, CCFG, text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg
@@ -50,18 +140,35 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
     bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
 
     fonte_score, fonte_details = verify_with_external_sources(text, SBERT)
+    fontes_individuais = _flatten_external_evidence(fonte_details)
 
-    final_score = fuse_scores(hist_score, bert_score_true, fonte_score, w_hist, w_bert, w_fontes)
-    final_label, final_conf_alt = classify_text(final_score)
+    # Adaptador online (se já houver updates)
+    online_prob = ONLINE.prob_true_for_text(text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg)
+    alpha_online = ONLINE.alpha() if ONLINE.is_trained() else 0.0
+
+    # Primeiro, média ponderada entre histórico, bert e fontes (reduzindo peso de BERT pelo (1-alpha))
+    base_final = fuse_scores(hist_score, bert_score_true, fonte_score, w_hist, w_bert * (1 - alpha_online), w_fontes)
+    # Em seguida, mesclar com o adaptador online conforme alpha
+    final_score = fuse_scores(base_final, (online_prob if online_prob is not None else 0.0), None, 1 - alpha_online, alpha_online, 0.0)
+    final_label, _ = classify_text(final_score)
+
+    historico_block = {
+        "consistencia": round(hist_score, 1),
+        "k": k,
+        "aggregate": hist_agg,
+    }
+    if use_wiki:
+        historico_block.update({
+            "faiss": hist_info.get("faiss"),
+            "wikipedia": hist_info.get("wikipedia"),
+            "pesos_hist": hist_info.get("pesos"),
+        })
+    else:
+        historico_block["vizinhos"] = neighbors
 
     payload = {
         "texto_analisado": text,
-        "historico": {
-            "consistencia": round(hist_score, 1),
-            "k": k,
-            "vizinhos": neighbors,
-            "aggregate": hist_agg,
-        },
+        "historico": historico_block,
         "bert": {
             "rotulo": bert_label,
             "prob_true": round(bert_score_true, 1),
@@ -70,6 +177,12 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
         "confirmacao_fontes": {
             "fonte_score": round(fonte_score, 1),
             "detalhes": fonte_details,
+            "fontes_individuais": fontes_individuais,
+        },
+        "online_adaptor": {
+            "prob_true": (round(online_prob, 1) if online_prob is not None else None),
+            "alpha": round(alpha_online, 2),
+            "n_updates": getattr(ONLINE, "n_updates", 0),
         },
         "final": {
             "rotulo": final_label,
@@ -121,6 +234,11 @@ def analyze():
     if bert_agg not in ("max", "mean"):
         bert_agg = DEFAULTS["bert_agg"]
 
+    use_wiki = _as_bool(data.get("use_wiki", DEFAULTS["use_wiki"]))
+    wiki_titles = _get_num("wiki_titles", int, DEFAULTS["wiki_titles"])
+    w_faiss = _get_num("w_faiss", float, DEFAULTS["w_faiss"])
+    w_wiki = _get_num("w_wiki", float, DEFAULTS["w_wiki"])
+
     result, status = analyze_text_payload(
         text=text,
         k=k,
@@ -131,11 +249,15 @@ def analyze():
         overlap_tokens=overlap_tokens,
         hist_agg=hist_agg,
         bert_agg=bert_agg,
+        use_wiki=use_wiki,
+        wiki_titles=wiki_titles,
+        w_faiss=w_faiss,
+        w_wiki=w_wiki,
     )
     return jsonify(result), status
 
 
-@app.route("/analyze_friendly", methods=["POST"])
+@app.route("/analyze_friendly", methods=["POST"]) 
 def analyze_friendly():
     data = {}
     if request.is_json:
@@ -157,6 +279,11 @@ def analyze_friendly():
     hist_agg = data.get("hist_agg", DEFAULTS["hist_agg"]).lower()
     bert_agg = data.get("bert_agg", DEFAULTS["bert_agg"]).lower()
 
+    use_wiki = _as_bool(data.get("use_wiki", DEFAULTS["use_wiki"]))
+    wiki_titles = int(data.get("wiki_titles", DEFAULTS["wiki_titles"]))
+    w_faiss = float(data.get("w_faiss", DEFAULTS["w_faiss"]))
+    w_wiki = float(data.get("w_wiki", DEFAULTS["w_wiki"]))
+
     result, status = analyze_text_payload(
         text=text,
         k=k,
@@ -167,6 +294,10 @@ def analyze_friendly():
         overlap_tokens=overlap_tokens,
         hist_agg=hist_agg,
         bert_agg=bert_agg,
+        use_wiki=use_wiki,
+        wiki_titles=wiki_titles,
+        w_faiss=w_faiss,
+        w_wiki=w_wiki,
     )
 
     if status != 200:
@@ -180,6 +311,11 @@ def analyze_friendly():
             "Probabilidade de Verdadeiro": f"{result['bert']['prob_true']}%",
         },
         "Confirmação por Fontes Externas": f"{result['confirmacao_fontes']['fonte_score']}%",
+        "Adaptador Online": {
+            "Prob Verdadeiro": (f"{result['online_adaptor']['prob_true']}%" if result['online_adaptor']['prob_true'] is not None else None),
+            "Alpha": result['online_adaptor']['alpha'],
+            "Atualizações": result['online_adaptor']['n_updates'],
+        },
         "Classificação Final": {
             "Rótulo": result["final"]["rotulo"],
             "Score": f"{result['final']['score']}%",
@@ -189,188 +325,100 @@ def analyze_friendly():
     return jsonify(friendly_output), 200
 
 
-@app.route("/", methods=["GET"]) 
-def index():
-    html = """
-    <!doctype html>
-    <meta charset=\"utf-8\" />
-    <title>GoldenFred - Verificador</title>
-    <style>
-      :root { --c-bg:#f5f7fa; --c-card:#ffffff; --c-border:#d0d7de; --c-accent:#2563eb; --c-text:#1f2328; --c-bad:#dc2626; --c-good:#059669; }
-      body { font-family: system-ui, Arial, sans-serif; max-width: 960px; margin: 1.5rem auto; padding: 0 1rem; background: var(--c-bg); color: var(--c-text); }
-      h1 { margin-top: .2rem; font-size: 1.6rem; }
-      textarea { width: 100%; min-height: 180px; resize: vertical; padding:.75rem; border:1px solid var(--c-border); border-radius:6px; font-size: .95rem; }
-      .panel, .card { background: var(--c-card); border:1px solid var(--c-border); border-radius:8px; padding:1rem 1.25rem; margin-bottom:1rem; box-shadow: 0 2px 4px rgba(0,0,0,.04); }
-      .row { display:flex; flex-wrap:wrap; gap:.75rem; margin:.5rem 0; }
-      label { font-size:.75rem; text-transform:uppercase; letter-spacing:.5px; display:flex; flex-direction:column; gap:.2rem; min-width:110px; }
-      input, select { padding:.45rem .5rem; border:1px solid var(--c-border); border-radius:5px; background:#fff; font-size:.8rem; }
-      button { cursor:pointer; background: var(--c-accent); color:#fff; border:none; padding:.7rem 1.1rem; border-radius:6px; font-weight:600; font-size:.85rem; display:inline-flex; align-items:center; gap:.4rem; }
-      button:disabled { opacity:.5; cursor:not-allowed; }
-      .results-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:.85rem; margin-top:.75rem; }
-      .metric { border:1px solid var(--c-border); border-radius:8px; padding:.6rem .75rem .75rem; background:#fff; position:relative; }
-      .metric h3 { margin:0 0 .35rem; font-size:.8rem; font-weight:600; letter-spacing:.5px; text-transform:uppercase; color:#555; }
-      .pct { font-size:1.35rem; font-weight:700; }
-      .bar { height:6px; border-radius:4px; background:linear-gradient(90deg,var(--c-accent),var(--c-good)); margin-top:.4rem; position:relative; overflow:hidden; }
-      .bar span { position:absolute; top:0; left:0; bottom:0; width:0%; background: linear-gradient(90deg,var(--c-accent),var(--c-good)); transition: width .6s ease; }
-      .final { border:2px solid var(--c-accent); }
-      .status { font-size:.75rem; font-weight:600; margin-top:.3rem; }
-      .status.good { color: var(--c-good); }
-      .status.bad { color: var(--c-bad); }
-      #detailsBox { display:none; margin-top:1rem; }
-      pre { background:#0f172a; color:#f1f5f9; padding:1rem; border-radius:8px; font-size:.75rem; line-height:1.25rem; overflow:auto; max-height:420px; }
-      .flex-between { display:flex; justify-content:space-between; align-items:center; gap:.75rem; }
-      .small { font-size:.7rem; color:#555; }
-      a.inline { font-size:.7rem; color:var(--c-accent); text-decoration:none; }
-      a.inline:hover { text-decoration:underline; }
-      .fade { animation: fade .35s ease; }
-      @keyframes fade { from{opacity:0; transform:translateY(4px);} to{opacity:1; transform:translateY(0);} }
-    </style>
-    <h1>GoldenFred</h1>
-    <p class=\"small\">Ferramenta experimental de apoio à verificação. Não substitui checagem humana. Forneça uma afirmação ou pequeno texto.</p>
-
-    <div class=\"panel\">
-      <label style=\"display:block; font-weight:600; margin-bottom:.5rem; font-size:.8rem; text-transform:uppercase; letter-spacing:.5px;\">Texto para análise</label>
-      <textarea id=\"text\" placeholder=\"Ex: O Brasil é o maior exportador mundial de café.\"></textarea>
-      <div class=\"row\" style=\"margin-top:.5rem;\">
-        <label>k
-          <input id=\"k\" type=\"number\" value=\"20\" min=\"1\" max=\"100\" />
-        </label>
-        <label>Peso histórico
-          <input id=\"w_hist\" type=\"number\" step=\"0.05\" value=\"0.333\" />
-        </label>
-        <label>Peso BERT
-          <input id=\"w_bert\" type=\"number\" step=\"0.05\" value=\"0.333\" />
-        </label>
-        <label>Peso fontes
-          <input id=\"w_fontes\" type=\"number\" step=\"0.05\" value=\"0.333\" />
-        </label>
-        <label>Hist agg
-          <select id=\"hist_agg\"><option>max</option><option>mean</option></select>
-        </label>
-        <label>BERT agg
-          <select id=\"bert_agg\"><option>mean</option><option>max</option></select>
-        </label>
-      </div>
-      <div class=\"row\">
-        <label>max_tokens
-          <input id=\"max_tokens\" type=\"number\" value=\"512\" />
-        </label>
-        <label>overlap_tokens
-          <input id=\"overlap_tokens\" type=\"number\" value=\"64\" />
-        </label>
-      </div>
-      <div class=\"flex-between\" style=\"margin-top:.75rem;\">
-        <div>
-          <button id=\"run\">Analisar</button>
-          <button id=\"toggleRaw\" style=\"background:#64748b;\" disabled>Mostrar detalhes</button>
-        </div>
-        <div class=\"small\">Endpoint bruto: <code>POST /analyze</code></div>
-      </div>
-    </div>
-
-    <div id=\"summaryArea\" style=\"display:none;\" class=\"fade\">
-      <div class=\"card\">
-        <h2 style=\"margin:0 0 .75rem; font-size:1.05rem;\">Resultados</h2>
-        <div class=\"results-grid\">
-          <div class=\"metric\" id=\"mHist\">
-            <h3>Consistência Histórica</h3>
-            <div class=\"pct\" id=\"pctHist\">--%</div>
-            <div class=\"bar\"><span id=\"barHist\"></span></div>
-            <div class=\"status\" id=\"stHist\"></div>
-          </div>
-          <div class=\"metric\" id=\"mBert\">
-            <h3>BERT (Prob. Verdadeiro)</h3>
-            <div class=\"pct\" id=\"pctBert\">--%</div>
-            <div class=\"bar\"><span id=\"barBert\"></span></div>
-            <div class=\"status\" id=\"stBert\"></div>
-          </div>
-          <div class=\"metric\" id=\"mFontes\">
-            <h3>Fontes Externas</h3>
-            <div class=\"pct\" id=\"pctFontes\">--%</div>
-            <div class=\"bar\"><span id=\"barFontes\"></span></div>
-            <div class=\"status\" id=\"stFontes\"></div>
-          </div>
-          <div class=\"metric final\" id=\"mFinal\" style=\"grid-column: span 1;\">
-            <h3>Média / Score Final</h3>
-            <div class=\"pct\" id=\"pctFinal\">--%</div>
-            <div class=\"bar\"><span id=\"barFinal\"></span></div>
-            <div class=\"status\" id=\"stFinal\"></div>
-          </div>
-        </div>
-        <p class=\"small\" style=\"margin-top:1rem;\">As porcentagens resultam de três sinais combinados pelos pesos definidos. Use como indicação inicial, não veredicto definitivo.</p>
-      </div>
-    </div>
-
-    <div id=\"detailsBox\" class=\"card fade\">
-      <div class=\"flex-between\" style=\"margin-bottom:.5rem;\">
-        <strong>Detalhes completos (JSON)</strong>
-        <button id=\"closeRaw\" style=\"background:#e11d48;\">Fechar</button>
-      </div>
-      <pre id=\"out\">{}</pre>
-    </div>
-
-    <script>
-      const el = id => document.getElementById(id);
-      const fmt = v => (v===null||v===undefined||isNaN(v)? '--' : (Math.round(v*10)/10) + '%');
-      function paint(idBar, idPct, idStatus, val){
-        el(idPct).textContent = fmt(val);
-        el(idBar).style.width = (val||0) + '%';
-        if(val===null || isNaN(val)) { el(idStatus).textContent=''; return; }
-        let cls=''; let txt='';
-        if(val >= 66){ cls='good'; txt='alto'; }
-        else if(val >= 40){ cls=''; txt='moderado'; }
-        else { cls='bad'; txt='baixo'; }
-        el(idStatus).className='status ' + cls;
-        el(idStatus).textContent = 'Nível ' + txt;
-      }
-      function toggleDetails(show){
-        el('detailsBox').style.display = show? 'block':'none';
-        el('toggleRaw').textContent = show? 'Ocultar detalhes':'Mostrar detalhes';
-      }
-      el('toggleRaw').onclick = ()=>{
-        if(el('detailsBox').style.display==='none'){ toggleDetails(true); } else { toggleDetails(false);} };
-      el('closeRaw').onclick = ()=> toggleDetails(false);
-
-      el('run').onclick = async () => {
-        const text = el('text').value.trim();
-        if(!text){ alert('Insira um texto.'); return; }
-        el('run').disabled = true; el('run').textContent='Analisando...'; toggleDetails(false); el('toggleRaw').disabled = true;
-        const body = {
-          text,
-          k: Number(el('k').value),
-          w_hist: Number(el('w_hist').value),
-          w_bert: Number(el('w_bert').value),
-          w_fontes: Number(el('w_fontes').value),
-          max_tokens: Number(el('max_tokens').value),
-          overlap_tokens: Number(el('overlap_tokens').value),
-          hist_agg: el('hist_agg').value,
-          bert_agg: el('bert_agg').value,
-        };
-        try {
-          const res = await fetch('/analyze', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-          const json = await res.json();
-          if(res.status !== 200){ alert(json.error || 'Erro na análise'); } else {
-            el('summaryArea').style.display='block';
-            const h = json.historico?.consistencia;
-            const b = json.bert?.prob_true;
-            const f = json.confirmacao_fontes?.fonte_score;
-            const fin = json.final?.score;
-            paint('barHist','pctHist','stHist', h);
-            paint('barBert','pctBert','stBert', b);
-            paint('barFontes','pctFontes','stFontes', f);
-            paint('barFinal','pctFinal','stFinal', fin);
-            el('out').textContent = JSON.stringify(json, null, 2);
-            el('toggleRaw').disabled = false;
-          }
-        } catch(e){
-          alert('Falha na requisição. Veja console.'); console.error(e);
-        } finally {
-          el('run').disabled = false; el('run').textContent='Analisar';
-        }
-      };
-    </script>
+@app.route("/train_online", methods=["POST"]) 
+def train_online():
     """
-    return render_template_string(html)
+    Atualiza o adaptador online com textos enviados pelo front.
+    Request JSON/body:
+    {
+      text: string | undefined,
+      texts: [string] | undefined,
+      label: "true"|"false"|"fake" | undefined,
+      labels: [..] | undefined,
+      auto_label: bool (default true, usa BERT atual),
+      threshold: number (0-1 ou 0-100; default 0.7),
+      max_tokens, overlap_tokens, bert_agg (opcionais para auto_label)
+    }
+    """
+    data = request.get_json(silent=True) or request.form.to_dict(flat=True) or {}
+
+    # Coletar textos
+    texts = []
+    if isinstance(data.get("texts"), list):
+        texts = [str(t) for t in data.get("texts")]
+    elif data.get("texts") and isinstance(data.get("texts"), str):
+        # permitir CSV simples
+        texts = [s for s in data.get("texts").split("\n") if s.strip()]
+    if data.get("text"):
+        texts.append(str(data.get("text")))
+    # limpar
+    texts = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
+
+    if not texts:
+        return jsonify({"updated": 0, "error": "nenhum texto fornecido"}), 400
+
+    # Labels (opcionais)
+    labels_in = None
+    if isinstance(data.get("labels"), list):
+        labels_in = [str(x).lower().strip() for x in data.get("labels")]
+    elif data.get("label"):
+        labels_in = [str(data.get("label")).lower().strip()] * len(texts)
+
+    auto_label = True if str(data.get("auto_label", "true")).lower() in ("1", "true", "yes", "y") else False
+    # Interpretar threshold em 0-1 ou 0-100
+    thr_raw = data.get("threshold", 0.7)
+    try:
+        thr = float(thr_raw)
+    except Exception:
+        thr = 0.7
+    if (thr > 1.0):
+        thr = thr / 100.0
+    thr = float(np.clip(thr, 0.5, 0.99))
+
+    max_tokens = int(data.get("max_tokens", DEFAULTS["max_tokens"])) if str(data.get("max_tokens", "")).strip() else DEFAULTS["max_tokens"]
+    overlap_tokens = int(data.get("overlap_tokens", DEFAULTS["overlap_tokens"])) if str(data.get("overlap_tokens", "")).strip() else DEFAULTS["overlap_tokens"]
+    bert_agg = str(data.get("bert_agg", DEFAULTS["bert_agg"]))
+    if bert_agg not in ("mean", "max"):
+        bert_agg = DEFAULTS["bert_agg"]
+
+    neg_label = _negative_label_from_le(LE)
+
+    # Se labels não foram fornecidas e auto_label ativo, gerar a partir do BERT atual
+    generated_labels = None
+    if (not labels_in) and auto_label:
+        generated_labels = []
+        for t in texts:
+            p = bert_probability_true_for_text(CLF, LE, SBERT, CCFG, t, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg)
+            lab = "true" if (p >= thr * 100.0) else neg_label
+            generated_labels.append(lab)
+        labels_in = generated_labels
+
+    if not labels_in or len(labels_in) != len(texts):
+        return jsonify({"updated": 0, "error": "labels ausentes ou tamanho incorreto; ative auto_label ou envie labels."}), 400
+
+    # Normalizar labels para os rótulos do encoder
+    allowed = set(list(getattr(LE, "classes_", [])))
+    labels_final = []
+    for lab in labels_in:
+        if lab == "true":
+            labels_final.append("true" if "true" in allowed else list(allowed)[0])
+        else:
+            # mapear qualquer não-true para o rótulo negativo presente
+            labels_final.append(neg_label if neg_label in allowed else list(allowed)[0])
+
+    try:
+        ok = ONLINE.update(texts, labels_final)
+    except Exception as e:
+        return jsonify({"updated": 0, "error": f"falha no update: {type(e).__name__}: {e}"}), 500
+
+    return jsonify({
+        "updated": int(ok) * len(texts),
+        "n_updates_total": getattr(ONLINE, "n_updates", 0),
+        "alpha": ONLINE.alpha() if ONLINE.is_trained() else 0.0,
+        "labels_used": labels_final,
+        "auto_label": auto_label,
+        "threshold": thr,
+    }), 200
 
 
 if __name__ == "__main__":

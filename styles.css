@@ -1,0 +1,240 @@
+/* Layout fix: ensure padding/border are included in width to avoid overflow */
+* , *::before, *::after { box-sizing: border-box; }
+
+:root {
+	--c-bg: #f5f7fa;
+	--c-card: #ffffff;
+	--c-border: #d0d7de;
+	--c-accent: #2563eb;
+	--c-text: #1f2328;
+	--c-bad: #dc2626;
+	--c-good: #059669;
+}
+body {
+	font-family: system-ui, Arial, sans-serif;
+	max-width: 960px;
+	margin: 1.5rem auto;
+	padding: 0 1rem;
+	background: var(--c-bg);
+	color: var(--c-text);
+}
+h1 {
+	margin-top: 0.2rem;
+	font-size: 1.6rem;
+}
+textarea {
+	width: 100%;
+	min-height: 180px;
+	resize: vertical;
+	padding: 0.75rem;
+	border: 1px solid var(--c-border);
+	border-radius: 6px;
+	font-size: 0.95rem;
+	/* guard against overflow on some browsers */
+	max-width: 100%;
+	display: block;
+}
+.panel,
+.card {
+	background: var(--c-card);
+	border: 1px solid var(--c-border);
+	border-radius: 8px;
+	padding: 1rem 1.25rem;
+	margin-bottom: 1rem;
+	box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+.row {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 0.75rem;
+	margin: 0.5rem 0;
+}
+label {
+	font-size: 0.75rem;
+	text-transform: uppercase;
+	letter-spacing: 0.5px;
+	display: flex;
+	flex-direction: column;
+	gap: 0.2rem;
+	min-width: 110px;
+}
+input,
+select {
+	padding: 0.45rem 0.5rem;
+	border: 1px solid var(--c-border);
+	border-radius: 5px;
+	background: #fff;
+	font-size: 0.8rem;
+	max-width: 100%;
+}
+button {
+	cursor: pointer;
+	background: var(--c-accent);
+	color: #fff;
+	border: none;
+	padding: 0.7rem 1.1rem;
+	border-radius: 6px;
+	font-weight: 600;
+	font-size: 0.85rem;
+	display: inline-flex;
+	align-items: center;
+	gap: 0.4rem;
+	max-width: 100%;
+}
+button:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+.results-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+	gap: 0.85rem;
+	margin-top: 0.75rem;
+}
+.metric {
+	border: 1px solid var(--c-border);
+	border-radius: 8px;
+	padding: 0.6rem 0.75rem 0.75rem;
+	background: #fff;
+	position: relative;
+}
+.metric h3 {
+	margin: 0 0 0.35rem;
+	font-size: 0.8rem;
+	font-weight: 600;
+	letter-spacing: 0.5px;
+	text-transform: uppercase;
+	color: #555;
+}
+.pct {
+	font-size: 1.35rem;
+	font-weight: 700;
+}
+.bar {
+	height: 6px;
+	border-radius: 4px;
+	background: linear-gradient(90deg, var(--c-accent), var(--c-good));
+	margin-top: 0.4rem;
+	position: relative;
+	overflow: hidden;
+}
+.bar span {
+	position: absolute;
+	top: 0;
+	left: 0;
+	bottom: 0;
+	width: 0%;
+	background: linear-gradient(90deg, var(--c-accent), var(--c-good));
+	transition: width 0.6s ease;
+}
+.final {
+	border: 2px solid var(--c-accent);
+}
+.status {
+	font-size: 0.75rem;
+	font-weight: 600;
+	margin-top: 0.3rem;
+}
+.status.good {
+	color: var(--c-good);
+}
+.status.bad {
+	color: var(--c-bad);
+}
+#detailsBox {
+	display: none;
+	margin-top: 1rem;
+}
+pre {
+	background: #0f172a;
+	color: #f1f5f9;
+	padding: 1rem;
+	border-radius: 8px;
+	font-size: 0.75rem;
+	line-height: 1.25rem;
+	overflow: auto;
+	max-height: 420px;
+}
+.flex-between {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	gap: 0.75rem;
+}
+.small {
+	font-size: 0.7rem;
+	color: #555;
+}
+a.inline {
+	font-size: 0.7rem;
+	color: var(--c-accent);
+	text-decoration: none;
+}
+a.inline:hover {
+	text-decoration: underline;
+}
+.fade {
+	animation: fade 0.35s ease;
+}
+@keyframes fade {
+	from {
+		opacity: 0;
+		transform: translateY(4px);
+	}
+	to {
+		opacity: 1;
+		transform: translateY(0);
+	}
+}
+.api-inline {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+.api-inline input {
+	min-width: 260px;
+}
+.sources-list {
+	display: flex;
+	flex-direction: column;
+	gap: 0.5rem;
+	margin-top: 0.5rem;
+}
+.source-item {
+	display: flex;
+	justify-content: space-between;
+	align-items: center;
+	border: 1px solid var(--c-border);
+	border-radius: 6px;
+	padding: 0.5rem 0.75rem;
+	background: #fff;
+	cursor: pointer;
+}
+.source-item:hover {
+	background: #f8fafc;
+}
+.source-item .meta {
+	font-size: 0.75rem;
+	color: #555;
+}
+.source-item .percent {
+	font-weight: 700;
+	font-size: 0.95rem;
+}
+.badge {
+	display: inline-block;
+	font-size: 0.65rem;
+	padding: 2px 6px;
+	border-radius: 999px;
+	background: #e2e8f0;
+	color: #334155;
+	margin-left: 0.4rem;
+}
+.badge.social {
+	background: #fee2e2;
+	color: #b91c1c;
+}
+.badge.fc {
+	background: #dcfce7;
+	color: #166534;
+}
