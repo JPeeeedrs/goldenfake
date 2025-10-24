@@ -1,0 +1,7 @@
+{
+  "model_name": "paraphrase-multilingual-MiniLM-L12-v2",
+  "dim": 384,
+  "index_type": "IndexFlatIP",
+  "count": 498519,
+  "normalize": true
+}
