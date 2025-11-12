@@ -5,7 +5,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>GoldenFake - Verificador (Front-end)</title>
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="/static/styles.css" />
 </head>
 
 <body>
@@ -17,24 +17,16 @@
 
   <div class="panel">
     <div class="flex-between" style="margin-bottom: 0.5rem">
-      <label class="api-inline" style="margin: 0">
-        <span>API base</span>
-        <input id="apiBase" type="text" placeholder="ex.: http://localhost:5000" />
-      </label>
+      <!-- Removido campo API base -->
       <div class="small">
         Endpoints: <code>POST /analyze</code> |
         <code>POST /train_online</code>
       </div>
     </div>
 
-    <label style="
-          display: block;
-          font-weight: 600;
-          margin-bottom: 0.5rem;
-          font-size: 0.8rem;
-          text-transform: uppercase;
-          letter-spacing: 0.5px;
-        ">Texto para análise</label>
+    <label
+      style="display: block;font-weight: 600;margin-bottom: 0.5rem;font-size: 0.8rem;text-transform: uppercase;letter-spacing: 0.5px;">Texto
+      para análise</label>
     <textarea id="text" placeholder="Ex: O Brasil é o maior exportador mundial de café."></textarea>
     <div class="row" style="margin-top: 0.5rem">
       <label>k
@@ -68,21 +60,6 @@
       </label>
       <label>overlap_tokens
         <input id="overlap_tokens" type="number" value="128" />
-      </label>
-      <label>use_wiki
-        <select id="use_wiki">
-          <option>false</option>
-          <option>true</option>
-        </select>
-      </label>
-      <label>wiki_titles
-        <input id="wiki_titles" type="number" value="3" />
-      </label>
-      <label>w_faiss
-        <input id="w_faiss" type="number" step="0.05" value="0.5" />
-      </label>
-      <label>w_wiki
-        <input id="w_wiki" type="number" step="0.05" value="0.5" />
       </label>
     </div>
     <div class="flex-between" style="margin-top: 0.75rem">
@@ -167,7 +144,7 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="script.js"></script>
+  <script src="/static/script.js"></script>
 </body>
 
 </html>

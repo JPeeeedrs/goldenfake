@@ -514,9 +514,12 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
         comb_eff = comb * ov_factor
         final_eff = comb_eff * EXTERNAL_SCORE_SCALE
         r2 = dict(r)
+        source_tags = _source_tags(url, publisher, r.get("rating"))
+        # Always set confianca_fonte to 0.7 for wiki sources, otherwise use calculated trust
+        confianca_fonte = 0.7 if "wiki" in source_tags else round(trust, 2)
         r2.update({
             "similaridade": round(sim, 3),
-            "confianca_fonte": round(trust, 2),
+            "confianca_fonte": confianca_fonte,
             "overlap_ratio": round(ov, 3),
             "overlap_bucket": ov_bucket,
             "overlap_factor": round(ov_factor, 2),
@@ -524,7 +527,7 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
             "passes_40pct": bool(pass40),
             "score": round(final_eff, 3),
             "is_social": bool(social),
-            "source_tags": _source_tags(url, publisher, r.get("rating")),
+            "source_tags": source_tags,
         })
         scored.append(r2)
     # filtrar apenas por similaridade mínima (overlap agora ajusta peso, não exclui)

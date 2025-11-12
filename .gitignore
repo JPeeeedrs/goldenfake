@@ -4,4 +4,3 @@ __pycache__/
 dados
 jsons
 embeddings
-faiss_index.bin

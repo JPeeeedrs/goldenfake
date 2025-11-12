@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/Iteratorusr/bin/env python3
 """Optimized hierarchical chunk embeddings for Wikipedia with GPU acceleration and compressed storage."""
 
 from __future__ import annotations
@@ -53,8 +53,11 @@ class ArticleDataset(Dataset):
             line = f.readline()
         # decodifica a linha (bytes -> str) antes de json.loads
         article = json.loads(line.decode("utf-8"))
-        text = article.get("text", "")
-        chunks = [text] if text.strip() else []
+        
+        # --- AQUI ESTÁ A CORREÇÃO LÓGICA ---
+        # Pega a lista direto da chave "chunks" do seu JSONL
+        chunks = article.get("chunks", []) 
+        
         return {"id": str(article.get("id", f"article_{idx:06d}")), "chunks": chunks, "index": idx}
 
 

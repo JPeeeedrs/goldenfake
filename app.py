@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, send_from_directory, request, jsonify
 import os
 import json
 import numpy as np
@@ -16,7 +16,11 @@ from fact_checker import (
 )
 from external_sources import verify_with_external_sources
 
-app = Flask(__name__)
+app = Flask(__name__, static_folder='static')
+
+@app.route('/')
+def serve_index():
+    return send_from_directory('.', 'index.html')
 
 # Habilitar CORS para desenvolvimento (inclui file:// como origem nula)
 try:
@@ -84,10 +88,14 @@ def _flatten_external_evidence(details):
                 continue
             seen.add(key)
             sc = ev.get("score")
-            try:
-                pct = round(float(sc) * 100.0, 1)
-            except Exception:
-                continue
+            # Force percent to 70.0 for wiki sources
+            if ev.get("source_tags") and "wiki" in ev.get("source_tags"):
+                pct = 70.0
+            else:
+                try:
+                    pct = round(float(sc) * 100.0, 1)
+                except Exception:
+                    continue
             rating = ev.get("rating")
             fc_flag = bool(ev.get("fact_checker")) or (
                 isinstance(rating, str) and "fact-check" in rating.lower())
