@@ -6,6 +6,7 @@ import faiss
 import joblib
 import re
 import requests
+from typing import Any, Dict, List, Tuple
 from sentence_transformers import SentenceTransformer
 from external_sources import verify_with_external_sources
 
@@ -59,6 +60,15 @@ except Exception:  # pragma: no cover
     SGDClassifier = None  # type: ignore
 
 ONLINE_ADAPTOR_PATH = os.path.join(MODEL_DIR, "online_adaptor.joblib")
+
+def _parse_float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except Exception:
+        return default
+
+
+ENTITY_BERT_WEIGHT = max(0.0, min(1.0, _parse_float_env("ENTITY_BERT_WEIGHT", 0.35)))
 
 
 class OnlineAdaptiveClassifier:
@@ -210,6 +220,33 @@ def _safe_div(a: float, b: float) -> float:
     return (a / b) if b else 0.0
 
 
+def blend_score_with_entities(base_score: float,
+                              entity_block: Dict[str, Any] | None,
+                              weight: float | None = None) -> Tuple[float, float | None]:
+    """Funde o score base com a média de entidades (0-100) usando peso beta."""
+    try:
+        base = float(base_score)
+    except Exception:
+        base = 0.0
+    if not entity_block:
+        return base, None
+    avg = entity_block.get("media_percent")
+    total = entity_block.get("total") or 0
+    if avg is None or total <= 0:
+        return base, None
+    try:
+        avg_float = float(avg)
+    except Exception:
+        return base, None
+    avg_float = max(0.0, min(100.0, avg_float))
+    w = ENTITY_BERT_WEIGHT if weight is None else float(weight)
+    w = max(0.0, min(1.0, w))
+    if w == 0.0:
+        return base, avg_float
+    blended = (1.0 - w) * base + w * avg_float
+    return blended, avg_float
+
+
 def extract_style_features(text: str) -> np.ndarray:
     t = text or ""
     n_chars = len(t)
@@ -264,7 +301,30 @@ def _get_style_scaler():
 def _token_ids(model: SentenceTransformer, text: str) -> list[int]:
     try:
         tok = model.tokenizer
-        return tok.encode(text, add_special_tokens=False)
+        # SentenceTransformer mantém max_seq_length separado; aumentamos manualmente o limite do tokenizer
+        max_len = getattr(tok, "model_max_length", None)
+        if isinstance(max_len, int) and max_len < 4096:
+            try:
+                tok.model_max_length = 16384
+                if hasattr(tok, "init_kwargs"):
+                    tok.init_kwargs["model_max_length"] = tok.model_max_length
+            except Exception:
+                pass
+        encoded = tok(
+            text,
+            add_special_tokens=False,
+            truncation=False,
+            padding=False,
+            return_attention_mask=False,
+            return_token_type_ids=False,
+        )
+        ids = encoded.get("input_ids") if isinstance(encoded, dict) else getattr(encoded, "input_ids", None)
+        if isinstance(ids, list) and ids and isinstance(ids[0], list):
+            ids = ids[0]
+        if isinstance(ids, list):
+            return ids
+        # último recurso com encode tradicional (com truncation desativado)
+        return tok.encode(text, add_special_tokens=False, truncation=False)
     except Exception:
         # Fallback: approximate by words as "tokens"
         return text.split()
@@ -674,13 +734,19 @@ def main():
         index, sbert, text, k=args.k, max_tokens=args.max_tokens, overlap_tokens=args.overlap_tokens, aggregate=args.hist_agg
     )
 
-    bert_score_true = bert_probability_true_for_text(
+    bert_score_true_raw = bert_probability_true_for_text(
         clf, le, sbert, ccfg, text, max_tokens=args.max_tokens, overlap_tokens=args.overlap_tokens, aggregate=args.bert_agg
     )
+    bert_score_true = bert_score_true_raw
+    entity_avg = None
     bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
 
     # Consultar fontes externas (opcional; requer chaves em .env para melhor cobertura)
-    fonte_score, fonte_details = verify_with_external_sources(text, sbert)
+    fonte_score, fonte_details, entity_block = verify_with_external_sources(text, sbert)
+    if entity_block:
+        bert_score_true, entity_avg = blend_score_with_entities(
+            bert_score_true_raw, entity_block, ENTITY_BERT_WEIGHT)
+        bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
 
     # Adicionar probabilidade do adaptador online, se treinado
     online_score = online_adaptor.prob_true_for_text(
@@ -705,11 +771,15 @@ def main():
         "bert": {
             "rotulo": bert_label,
             "prob_true": round(bert_score_true, 1),
+            "prob_true_raw": round(bert_score_true_raw, 1),
+            "entity_avg_percent": (round(entity_avg, 1) if entity_avg is not None else None),
+            "entity_blend_weight": round(ENTITY_BERT_WEIGHT, 2),
             "aggregate": args.bert_agg,
         },
         "confirmacao_fontes": {
             "fonte_score": round(fonte_score, 1),
             "detalhes": fonte_details,
+            "entidades_verificadas": entity_block,
         },
         "online_adaptor": {
             "prob_true": round(online_score, 1) if online_score is not None else None,

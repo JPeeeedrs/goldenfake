@@ -1,7 +1,7 @@
 from flask import Flask, send_from_directory, request, jsonify
 import os
-import json
 import numpy as np
+import requests
 
 # Reuso do pipeline existente
 from fact_checker import (
@@ -13,8 +13,19 @@ from fact_checker import (
     classify_text,
     load_online_adaptor,
     combined_historical_consistency_for_text,
+    blend_score_with_entities,
+    ENTITY_BERT_WEIGHT,
 )
 from external_sources import verify_with_external_sources
+
+WIKI_API_URL = "https://pt.wikipedia.org/w/api.php"
+WIKI_NEIGHBOR_LIMIT = 5
+WIKI_ABS_MAX_RESULTS = 50
+WIKI_SIMILARITY_THRESHOLD = 0.7
+WIKI_REQUEST_HEADERS = {
+    "User-Agent": "GoldenFake/1.0 (+https://github.com/JPeeeedrs/goldenfake)"
+}
+_WIKI_INFO_CACHE: dict[str, dict] = {}
 
 app = Flask(__name__, static_folder='static')
 
@@ -37,15 +48,16 @@ ONLINE = load_online_adaptor(LE, SBERT, CCFG)
 
 DEFAULTS = {
     "k": 20,
-    "w_hist": 0.5,
-    "w_bert": 0.35,
-    "w_fontes": 0.33,
+    "w_hist": 0.4,
+    "w_bert": 0.3,
+    "w_fontes": 0.3,
+    "entity_bert_weight": ENTITY_BERT_WEIGHT,
     # novos padrões de chunking
     "max_tokens": 512,
     "overlap_tokens": 128,
     "hist_agg": "max",   # max ou mean
     "bert_agg": "mean",  # mean ou max
-    # Wikipedia dinâmico (opcional)
+    # parâmetros de recuperação híbrida FAISS + Wikipedia
     "use_wiki": False,
     "wiki_titles": 3,
     "w_faiss": 0.5,
@@ -88,9 +100,19 @@ def _flatten_external_evidence(details):
                 continue
             seen.add(key)
             sc = ev.get("score")
+            tags = ev.get("source_tags") or []
+            rating_text = str(ev.get("rating") or "").strip().lower()
+            is_false_fact_check = False
+            if rating_text:
+                for token in ("falso", "false", "fake", "enganoso", "mentira", "boato", "hoax", "incorrect", "incorreto", "impreciso"):
+                    if token in rating_text:
+                        is_false_fact_check = True
+                        break
             # Force percent to 70.0 for wiki sources
-            if ev.get("source_tags") and "wiki" in ev.get("source_tags"):
+            if "wiki" in tags:
                 pct = 70.0
+            elif is_false_fact_check:
+                pct = 0.0
             else:
                 try:
                     pct = round(float(sc) * 100.0, 1)
@@ -99,6 +121,15 @@ def _flatten_external_evidence(details):
             rating = ev.get("rating")
             fc_flag = bool(ev.get("fact_checker")) or (
                 isinstance(rating, str) and "fact-check" in rating.lower())
+            verdict = None
+            if isinstance(rating, str):
+                lower_rating = rating.lower()
+                if any(tok in lower_rating for tok in ("false", "falso", "fake", "enganoso", "mentira", "boato", "hoax")):
+                    verdict = "false"
+                    pct = 0.0
+                elif any(tok in lower_rating for tok in ("true", "verdadeiro", "verídico", "correct", "correto", "confirmed", "confirmado")):
+                    verdict = "true"
+                    pct = 100.0
             items.append({
                 "title": ev.get("title"),
                 "url": url,
@@ -115,18 +146,143 @@ def _flatten_external_evidence(details):
                 "fact_checker": fc_flag,
                 "rating": rating,
                 # include backend-generated source tags for UI badges
-                "source_tags": ev.get("source_tags") or [],
+                "source_tags": tags,
+                "fact_check_invalida": is_false_fact_check,
+                "fact_check_veredito": verdict,
+                "gemini_confidence": ev.get("gemini_confidence"),
+                "gemini_evidence_used": ev.get("gemini_evidence_used"),
+                "gemini_veredito": ev.get("gemini_verdict") or verdict,
             })
     items.sort(key=lambda x: x.get("percent", 0), reverse=True)
     return items
 
 
+def _batched(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
+def _normalize_category_title(title: str | None) -> str | None:
+    if not title:
+        return None
+    if title.startswith("Categoria:"):
+        return title.split(":", 1)[-1]
+    return title
+
+
+def _clamp_wiki_limit(k: int | None, wiki_titles: int | None) -> int:
+    candidates = [wiki_titles, k, WIKI_NEIGHBOR_LIMIT]
+    for cand in candidates:
+        if isinstance(cand, (int, float)) and cand and cand > 0:
+            val = int(cand)
+            return max(1, min(val, WIKI_ABS_MAX_RESULTS))
+    return WIKI_NEIGHBOR_LIMIT
+
+
+def _fetch_wikipedia_metadata(page_ids: list[str]) -> dict[str, dict]:
+    page_ids = [str(pid) for pid in page_ids if pid]
+    if not page_ids:
+        return {}
+    missing = [pid for pid in page_ids if pid not in _WIKI_INFO_CACHE]
+    for chunk in _batched(missing, 20):
+        params = {
+            "action": "query",
+            "format": "json",
+            "prop": "info|categories",
+            "inprop": "url|displaytitle",
+            "cllimit": 20,
+            "pageids": "|".join(chunk),
+        }
+        try:
+            resp = requests.get(
+                WIKI_API_URL,
+                params=params,
+                timeout=4,
+                headers=WIKI_REQUEST_HEADERS,
+            )
+            resp.raise_for_status()
+            pages = (resp.json().get("query", {}) or {}).get("pages", {}) or {}
+            for pid, data in pages.items():
+                cats = []
+                for cat in data.get("categories") or []:
+                    norm = _normalize_category_title(cat.get("title"))
+                    if norm:
+                        cats.append(norm)
+                _WIKI_INFO_CACHE[pid] = {
+                    "title": data.get("title"),
+                    "displaytitle": data.get("displaytitle"),
+                    "fullurl": data.get("fullurl"),
+                    "categories": cats,
+                }
+        except Exception:
+            for pid in chunk:
+                _WIKI_INFO_CACHE.setdefault(pid, {})
+    return {pid: _WIKI_INFO_CACHE.get(pid, {}).copy() for pid in page_ids}
+
+
+def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
+                        similarity_threshold=WIKI_SIMILARITY_THRESHOLD):
+    section = {
+        "artigos_wikipedia_similares": [],
+        "total_encontrado": 0,
+        "limite_exibido": 0,
+        "limite_configurado": limit,
+        "limiar_similaridade": similarity_threshold,
+    }
+    if not neighbors or not metadata:
+        return section
+
+    best_by_article: dict[str, float] = {}
+    for idx, sim in neighbors:
+        if idx is None or idx < 0:
+            continue
+        if idx >= len(metadata):
+            continue
+        meta = metadata[idx] or {}
+        article_id = str(meta.get("id")) if meta.get("id") is not None else None
+        if not article_id:
+            continue
+        sim_val = float(sim or 0.0)
+        current = best_by_article.get(article_id)
+        if current is None or sim_val > current:
+            best_by_article[article_id] = sim_val
+
+    if not best_by_article:
+        return section
+
+    sorted_articles = sorted(best_by_article.items(), key=lambda x: x[1], reverse=True)
+    filtered = [(aid, score) for aid, score in sorted_articles if score >= similarity_threshold]
+    section["total_encontrado"] = len(filtered)
+    top = filtered[:limit]
+    section["limite_exibido"] = len(top)
+    if not top:
+        return section
+
+    meta_map = _fetch_wikipedia_metadata([aid for aid, _ in top])
+    articles = []
+    for aid, score in top:
+        info = meta_map.get(aid) or {}
+        cats = info.get("categories") or []
+        articles.append({
+            "id": aid,
+            "titulo": info.get("displaytitle") or info.get("title") or f"Artigo {aid}",
+            "similaridade": round(float(score), 3),
+            "categoria": cats[0] if cats else None,
+            "categorias": cats,
+            "url": info.get("fullurl") or f"https://pt.wikipedia.org/?curid={aid}",
+        })
+    section["artigos_wikipedia_similares"] = articles
+    return section
+
+
 def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_fontes: float,
+                         entity_bert_weight: float,
                          max_tokens: int, overlap_tokens: int, hist_agg: str, bert_agg: str,
                          use_wiki: bool, wiki_titles: int, w_faiss: float, w_wiki: float):
     text = (text or "").strip()
     if not text:
         return {"error": "texto vazio"}, 400
+    wiki_limit = _clamp_wiki_limit(k, wiki_titles)
 
     # Consistência histórica (FAISS) ou combinação com Wikipedia
     hist_info = {}
@@ -137,7 +293,7 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             max_tokens=max_tokens,
             overlap_tokens=overlap_tokens,
             aggregate=hist_agg,
-            wiki_titles=wiki_titles,
+            wiki_titles=wiki_limit,
             w_faiss=w_faiss,
             w_wiki=w_wiki,
         )
@@ -147,12 +303,18 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             INDEX, SBERT, text, k=k, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=hist_agg
         )
 
-    bert_score_true = bert_probability_true_for_text(
+    bert_score_true_raw = bert_probability_true_for_text(
         CLF, LE, SBERT, CCFG, text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg
     )
+    bert_score_true = bert_score_true_raw
     bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
 
-    fonte_score, fonte_details = verify_with_external_sources(text, SBERT)
+    fonte_score, fonte_details, entity_block = verify_with_external_sources(text, SBERT)
+    entity_avg = None
+    if entity_block:
+        bert_score_true, entity_avg = blend_score_with_entities(
+            bert_score_true_raw, entity_block, entity_bert_weight)
+        bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
     fontes_individuais = _flatten_external_evidence(fonte_details)
 
     # Adaptador online (se já houver updates)
@@ -188,12 +350,16 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
         "bert": {
             "rotulo": bert_label,
             "prob_true": round(bert_score_true, 1),
+            "prob_true_raw": round(bert_score_true_raw, 1),
+            "entity_avg_percent": (round(entity_avg, 1) if entity_avg is not None else None),
+            "entity_blend_weight": round(entity_bert_weight, 2),
             "aggregate": bert_agg,
         },
         "confirmacao_fontes": {
             "fonte_score": round(fonte_score, 1),
             "detalhes": fonte_details,
             "fontes_individuais": fontes_individuais,
+            "entidades_verificadas": entity_block,
         },
         "online_adaptor": {
             "prob_true": (round(online_prob, 1) if online_prob is not None else None),
@@ -204,11 +370,23 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             "rotulo": final_label,
             "score": round(final_score, 1),
         },
-        "pesos": {"historico": w_hist, "bert": w_bert, "fontes": w_fontes},
+        "pesos": {
+            "historico": w_hist,
+            "bert": w_bert,
+            "fontes": w_fontes,
+            "entity_bert_weight": entity_bert_weight,
+        },
         "chunking": {
             "max_tokens": max_tokens,
             "overlap_tokens": overlap_tokens,
         },
+    }
+    wiki_section = _build_wiki_sources(neighbors, METADATA, limit=wiki_limit)
+    payload["fontes_externas"] = wiki_section
+    payload["wikipedia"] = {
+        "matches": wiki_section.get("artigos_wikipedia_similares", []),
+        "score": (hist_info.get("wikipedia", {}).get("score") if use_wiki else None),
+        "titles_limit": wiki_limit,
     }
     return payload, 200
 
@@ -239,6 +417,7 @@ def analyze():
     w_hist = _get_num("w_hist", float, DEFAULTS["w_hist"])
     w_bert = _get_num("w_bert", float, DEFAULTS["w_bert"])
     w_fontes = _get_num("w_fontes", float, DEFAULTS["w_fontes"])
+    entity_weight = _get_num("entity_bert_weight", float, DEFAULTS["entity_bert_weight"])
 
     max_tokens = _get_num("max_tokens", int, DEFAULTS["max_tokens"])
     overlap_tokens = _get_num("overlap_tokens", int,
@@ -262,6 +441,7 @@ def analyze():
         w_hist=w_hist,
         w_bert=w_bert,
         w_fontes=w_fontes,
+        entity_bert_weight=entity_weight,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         hist_agg=hist_agg,
@@ -291,6 +471,7 @@ def analyze_friendly():
     w_hist = float(data.get("w_hist", DEFAULTS["w_hist"]))
     w_bert = float(data.get("w_bert", DEFAULTS["w_bert"]))
     w_fontes = float(data.get("w_fontes", DEFAULTS["w_fontes"]))
+    entity_weight = float(data.get("entity_bert_weight", DEFAULTS["entity_bert_weight"]))
     max_tokens = int(data.get("max_tokens", DEFAULTS["max_tokens"]))
     overlap_tokens = int(
         data.get("overlap_tokens", DEFAULTS["overlap_tokens"]))
@@ -308,6 +489,7 @@ def analyze_friendly():
         w_hist=w_hist,
         w_bert=w_bert,
         w_fontes=w_fontes,
+        entity_bert_weight=entity_weight,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         hist_agg=hist_agg,

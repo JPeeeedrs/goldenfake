@@ -4,3 +4,5 @@ __pycache__/
 dados
 jsons
 embeddings
+app.spec
+temp_text.txt

@@ -10,6 +10,69 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 from urllib.parse import urlparse
 
+try:
+    import spacy  # type: ignore
+except Exception:  # pragma: no cover - spaCy pode não estar disponível em runtime
+    spacy = None
+
+
+_SPACY_NLP = None
+ENTITY_TYPES = {
+    "PERSON",
+    "PER",
+    "ORG",
+    "GPE",
+    "LOC",
+    "FAC",
+    "EVENT",
+    "NORP",
+    "PRODUCT",
+    "WORK_OF_ART",
+    "LAW",
+    "MISC",
+}
+MAX_ENTITY_CHECKS = 18
+ENTITY_SEARCH_SLEEP = 0.25
+ENTITY_STRONG_SCORE = 1.0
+ENTITY_WEAK_SCORE = 0.35
+ENTITY_MISSING_SCORE = 0.0
+ENTITY_STATUS_LABELS = {
+    "strong": "Corroboração forte",
+    
+    "weak": "Corroboração fraca",
+    "missing": "Bolha de vácuo",
+}
+TITLE_PREFIXES = {
+    "dr",
+    "dr.",
+    "dra",
+    "dra.",
+    "prof",
+    "prof.",
+    "profª",
+    "profª.",
+    "sr",
+    "sr.",
+    "sra",
+    "sra.",
+}
+
+GENERIC_ENTITY_PREFIXES = {
+    "cientista",
+    "cientistas",
+    "pesquisador",
+    "pesquisadores",
+    "organismo",
+    "campo",
+    "teoricamente",
+    "investigação",
+    "investigadores",
+    "relatório",
+    "descoberta",
+    "metal",
+    "banda",
+}
+
 logger = logging.getLogger(__name__)
 
 # Substitui o carregamento via variáveis de ambiente por leitura direta de .env
@@ -25,6 +88,7 @@ def _read_env(path: str = _DEF_ENV_PATH) -> Dict[str, str]:
                 s = line.strip()
                 if not s or s.startswith("#") or "=" not in s:
                     continue
+
                 key, val = s.split("=", 1)
                 key = key.strip()
                 val = val.strip().strip('"').strip("'")
@@ -35,6 +99,235 @@ def _read_env(path: str = _DEF_ENV_PATH) -> Dict[str, str]:
     return env
 
 ENV = _read_env()
+
+def _get_spacy_model():
+    global _SPACY_NLP
+    if _SPACY_NLP is not None:
+        return _SPACY_NLP
+    if spacy is None:
+        _SPACY_NLP = None
+        return None
+    try:
+        _SPACY_NLP = spacy.load("pt_core_news_sm")
+    except Exception:
+        logger.warning("Falha ao carregar modelo spaCy pt_core_news_sm", exc_info=True)
+        _SPACY_NLP = None
+    return _SPACY_NLP
+
+
+def _fallback_entities(text: str, limit: int) -> List[str]:
+    pattern = re.compile(
+        r"([A-ZÁÉÍÓÚÂÊÔÃÕ][\wÁÉÍÓÚÂÊÔÃÕçãõà-ü'-]+(?:\s+(?:de|da|do|dos|das|e|para|del|di|la|el|van|von)?\s*[A-ZÁÉÍÓÚÂÊÔÃÕ][\wÁÉÍÓÚÂÊÔÃÕçãõà-ü'-]+){0,5})"
+    )
+    seen = set()
+    entities: List[str] = []
+    for match in pattern.finditer(text):
+        candidate = match.group(0).strip()
+        words = candidate.split()
+        if len(words) < 2:
+            continue
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entities.append(candidate)
+        if len(entities) >= limit:
+            break
+    return entities
+
+
+def _clean_entity_value(value: str) -> str:
+    value = value or ""
+    # remover citações do tipo [n] ou [n]
+    value = re.sub(r"\[\d+\]?", "", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" ,.;:\"'[]")
+
+
+def _normalize_entity_key(value: str) -> str:
+    cleaned = _clean_entity_value(value).lower()
+    cleaned = re.sub(r"[\.,;:\"'`´()\[\]]+", " ", cleaned)
+    tokens = [t for t in cleaned.split() if t]
+    while tokens:
+        first = tokens[0].rstrip(".")
+        if first in TITLE_PREFIXES:
+            tokens = tokens[1:]
+            continue
+        break
+    if not tokens:
+        return cleaned.strip()
+    return " ".join(tokens)
+
+
+def _should_skip_entity(value: str, label: str | None) -> bool:
+    raw = _clean_entity_value(value)
+    key = _normalize_entity_key(raw)
+    if not key:
+        return True
+    tokens = key.split()
+    if not tokens:
+        return True
+    first = tokens[0]
+    if first in GENERIC_ENTITY_PREFIXES:
+        return True
+    if label in {"MISC"} and len(tokens) < 2:
+        token_raw = raw.strip()
+        if token_raw.isalpha() and token_raw.upper() == token_raw and len(token_raw) >= 4:
+            return False
+        return True
+    return False
+
+
+def _collect_following_tokens(
+    doc,
+    start: int,
+    max_tokens: int = 4,
+    skip_initial_punct: bool = False,
+) -> List[str]:
+    tokens: List[str] = []
+    idx = start
+    captured = 0
+    while idx < len(doc) and captured < max_tokens:
+        tok = doc[idx]
+        if tok.is_space:
+            idx += 1
+            continue
+        text = tok.text.strip()
+        if not text:
+            idx += 1
+            continue
+        if tok.is_punct:
+            if not tokens and skip_initial_punct:
+                idx += 1
+                continue
+            break
+        if re.match(r"^\[\d+\]?$", text):
+            idx += 1
+            continue
+        if text in {"-", "·"}:
+            tokens.append(text)
+            idx += 1
+            continue
+        if len(text) == 1 and text.lower() in {"o", "a", "e"}:
+            idx += 1
+            continue
+        if text[0].isupper() or text.isupper() or tok.ent_type_ in ENTITY_TYPES:
+            tokens.append(text)
+            captured += 1
+            idx += 1
+            continue
+        break
+    return tokens
+
+
+def _collect_parenthetical(doc, start: int, max_len: int = 6) -> List[str]:
+    if start >= len(doc) or doc[start].text != "(":
+        return []
+    tokens = []
+    depth = 0
+    idx = start
+    while idx < len(doc) and len(tokens) < max_len:
+        tok = doc[idx]
+        tokens.append(tok.text)
+        if tok.text == "(":
+            depth += 1
+        elif tok.text == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        idx += 1
+    if depth == 0 and tokens:
+        return tokens
+    return []
+
+
+def _normalize_entity_span(ent) -> str:
+    value = _clean_entity_value(ent.text)
+    doc = ent.doc
+    lower_value = value.lower().rstrip(".")
+    is_person_label = ent.label_ in {"PERSON", "PER"}
+    needs_title_extension = lower_value in TITLE_PREFIXES
+    if is_person_label and (needs_title_extension or len(value.split()) < 2):
+        extra = _collect_following_tokens(
+            doc,
+            ent.end,
+            max_tokens=4,
+            skip_initial_punct=True,
+        )
+        if extra:
+            value = _clean_entity_value(f"{value} {' '.join(extra)}")
+    elif needs_title_extension:
+        extra = _collect_following_tokens(
+            doc,
+            ent.end,
+            max_tokens=4,
+            skip_initial_punct=True,
+        )
+        if extra:
+            value = _clean_entity_value(f"{value} {' '.join(extra)}")
+    if ent.label_ in {"ORG", "GPE", "FAC", "LOC"}:
+        paren = _collect_parenthetical(doc, ent.end)
+        if paren:
+            value = _clean_entity_value(f"{value} {' '.join(paren)}")
+    return value
+
+
+def extract_entities_for_verification(text: str, limit: int = MAX_ENTITY_CHECKS) -> List[str]:
+
+    text = (text or "").strip()
+    if not text:
+        return []
+    nlp = _get_spacy_model()
+    entities: List[str] = []
+    seen = set()
+    if nlp is not None:
+        doc = nlp(text)
+        for ent in doc.ents:
+            if ent.label_ not in ENTITY_TYPES:
+                continue
+            value = _normalize_entity_span(ent)
+            if len(value) < 3:
+                continue
+            if _should_skip_entity(value, ent.label_):
+                continue
+            key = _normalize_entity_key(value)
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            entities.append(value)
+            if len(entities) >= limit:
+                break
+    if entities:
+        return entities
+    fallback = _fallback_entities(text, limit)
+    if fallback:
+        deduped = []
+        seen.clear()
+        for value in fallback:
+            if _should_skip_entity(value, None):
+                continue
+            key = _normalize_entity_key(value)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(value)
+            if len(deduped) >= limit:
+                break
+        return deduped
+    return []
+
+
+_GEMINI_MODEL_DEFAULT = "gemini-1.5-flash"
+_GEMINI_MODEL = ENV.get("GEMINI_MODEL") or ENV.get("GEMINI_MODEL_NAME")
+if isinstance(_GEMINI_MODEL, str):
+    _GEMINI_MODEL = _GEMINI_MODEL.strip()
+if not _GEMINI_MODEL:
+    _GEMINI_MODEL = _GEMINI_MODEL_DEFAULT
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{_GEMINI_MODEL}:generateContent"
+)
 
 # Domínios de checagem de fatos PT/ES comuns
 FACT_CHECK_DOMAINS = {
@@ -315,6 +608,159 @@ def query_bing(claim: str, api_key: str, mkt: str = "pt-BR") -> List[Dict[str, A
         return []
 
 
+def _classify_entity_results(results: List[Dict[str, Any]]) -> Tuple[str, float]:
+    if not results:
+        return "missing", ENTITY_MISSING_SCORE
+    trusted_hits = 0
+    weak_hits = 0
+    for r in results:
+        url = r.get("url") or ""
+        publisher = r.get("publisher") or ""
+        tags = _source_tags(url, publisher, r.get("rating"))
+        trust = _domain_weight(url)
+        if "wiki" in tags or "news" in tags or trust >= 0.85:
+            trusted_hits += 1
+        elif "blog" in tags or "forum" in tags or "social" in tags or trust <= 0.5:
+            weak_hits += 1
+    if trusted_hits:
+        return "strong", ENTITY_STRONG_SCORE
+    if weak_hits:
+        return "weak", ENTITY_WEAK_SCORE
+    return "weak", 0.5
+
+
+def verify_entities_with_serpapi(text: str, api_key: str) -> Dict[str, Any]:
+    if not api_key:
+        return {}
+    entities = extract_entities_for_verification(text)
+    if not entities:
+        return {}
+    results_block: List[Dict[str, Any]] = []
+    strong = weak = missing = 0
+    for ent in entities:
+        try:
+            res = query_serpapi(ent, api_key)
+        except Exception:
+            res = []
+        top = res[:5]
+        for item in top:
+            url = item.get("url") or ""
+            tags = _source_tags(url, item.get("publisher"), item.get("rating"))
+            item["source_tags"] = tags
+            item["confianca_fonte"] = round(_domain_weight(url), 2)
+        status, score = _classify_entity_results(top)
+        if status == "strong":
+            strong += 1
+        elif status == "missing":
+            missing += 1
+        else:
+            weak += 1
+        results_block.append({
+            "entidade": ent,
+            "status": status,
+            "rotulo": ENTITY_STATUS_LABELS.get(status, status),
+            "score": round(score, 2),
+            "resultados": top,
+            "total_resultados": len(res),
+        })
+        time.sleep(ENTITY_SEARCH_SLEEP)
+    if not results_block:
+        return {}
+    avg_score = sum(item["score"] for item in results_block) / max(1, len(results_block))
+    return {
+        "entidades": results_block,
+        "media_score": round(avg_score, 3),
+        "media_percent": round(avg_score * 100.0, 1),
+        "total": len(results_block),
+        "fortes": strong,
+        "fracas": weak,
+        "ausentes": missing,
+    }
+
+
+def _extract_json_dict(text: str) -> Dict[str, Any] | None:
+    if not text:
+        return None
+    snippet = text.strip()
+    if snippet.startswith("```"):
+        parts = snippet.split("```")
+        if len(parts) >= 2:
+            snippet = parts[1]
+    snippet = snippet.strip()
+    if snippet.lower().startswith("json"):
+        snippet = snippet[4:].strip()
+    try:
+        return json.loads(snippet)
+    except Exception:
+        pass
+    start = snippet.find("{")
+    end = snippet.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(snippet[start:end + 1])
+        except Exception:
+            return None
+    return None
+
+
+def query_gemini_factcheck(claim: str, api_key: str, context: List[Dict[str, Any]] | None = None) -> Dict[str, Any] | None:
+    if not api_key or not claim:
+        return None
+    evidence_snippets: List[str] = []
+    for item in (context or [])[:3]:
+        title = item.get("title") or item.get("url") or "(sem título)"
+        publisher = item.get("publisher") or item.get("provider") or ""
+        evidence_snippets.append(f"- {title} ({publisher})")
+    instructions = [
+        "Você é um checador de fatos especializado em português.",
+        "Analise a afirmação abaixo considerando as evidências disponíveis (se houver) e determine se ela é verdadeira, falsa ou inconclusiva.",
+        "Responda estritamente em JSON com as chaves: verdict (true/false/inconclusivo), confidence (0-1), justification (texto curto), evidence_used (array de strings).",
+        f"Afirmação: {claim}",
+    ]
+    if evidence_snippets:
+        instructions.append("Referências detectadas:")
+        instructions.extend(evidence_snippets)
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": "\n".join(instructions)
+                    }
+                ]
+            }
+        ]
+    }
+    try:
+        resp = requests.post(
+            GEMINI_API_URL,
+            params={"key": api_key},
+            json=payload,
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            logger.warning("Gemini API status %s: %s", resp.status_code, resp.text[:200])
+            return None
+        data = resp.json()
+        candidates = data.get("candidates") or []
+        for cand in candidates:
+            parts = (cand.get("content") or {}).get("parts") or []
+            for part in parts:
+                txt = part.get("text")
+                parsed = _extract_json_dict(txt)
+                if not isinstance(parsed, dict):
+                    continue
+                verdict = (parsed.get("verdict") or "").strip().lower()
+                if not verdict and isinstance(parsed.get("verdict"), bool):
+                    verdict = "true" if parsed["verdict"] else "false"
+                    if verdict in {"verdadeiro", "true", "falso", "false", "inconclusivo", "unknown", "incerto", "uncertain"}:
+                        return parsed
+        return None
+    except Exception:
+        logger.exception("Erro na consulta ao Gemini API")
+        return None
+
+
 RATING_MAP = {
     # Normalização simples para números em [0,1]
     "true": 1.0,
@@ -334,6 +780,32 @@ RATING_MAP = {
     "exaggerated": 0.2,
     "falso": 0.0,
     "false": 0.0,
+}
+
+FACT_CHECK_TRUE_KEYWORDS = {
+    "true",
+    "verdadeiro",
+    "verídico",
+    "correct",
+    "correto",
+    "accurate",
+    "real",
+    "confirmed",
+    "confirmado",
+}
+
+FACT_CHECK_FALSE_KEYWORDS = {
+    "false",
+    "falso",
+    "fake",
+    "enganoso",
+    "mentira",
+    "boato",
+    "hoax",
+    "incorrect",
+    "incorreto",
+    "impreciso",
+    "misleading",
 }
 
 # Stopwords básicas PT/EN para evitar contar palavras funcionais
@@ -382,6 +854,19 @@ def _rating_to_score(text: str | None) -> float:
         if key in t:
             return val
     return 0.5
+
+
+def _fact_check_verdict(rating: str | None) -> str | None:
+    if not rating:
+        return None
+    t = rating.strip().lower()
+    for token in FACT_CHECK_FALSE_KEYWORDS:
+        if token in t:
+            return "false"
+    for token in FACT_CHECK_TRUE_KEYWORDS:
+        if token in t:
+            return "true"
+    return None
 
 
 # Amortecedor global para reduzir a influência do score de fontes externas
@@ -446,6 +931,9 @@ def _source_tags(url: str, publisher: str | None, rating: str | None) -> List[st
             tags.add("news")
         if any(d == pr or d.endswith("." + pr) for pr in PR_DOMAINS):
             tags.add("press-release")
+        if "ai.google" in d or "gemini" in d:
+            tags.add("ai")
+            tags.add("gemini")
 
     # publisher heuristics
     if pub:
@@ -455,6 +943,13 @@ def _source_tags(url: str, publisher: str | None, rating: str | None) -> List[st
             tags.add("gov")
         if "noticias" in pub or "news" in pub or "jornal" in pub:
             tags.add("news")
+        if "gemini" in pub:
+            tags.add("ai")
+            tags.add("gemini")
+
+    if rating and isinstance(rating, str) and "gemini" in rating.lower():
+        tags.add("ai")
+        tags.add("gemini")
 
     return sorted(tags)
 
@@ -551,8 +1046,8 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
     return avg_top10_pct, top
 
 
-def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple[float, List[Dict[str, Any]]]:
-    """Calcula fonte_score (0-100) e retorna detalhes por afirmação.
+def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple[float, List[Dict[str, Any]], Dict[str, Any]]:
+    """Calcula fonte_score (0-100), retorna detalhes por afirmação e resumo de entidades.
     Integra Google Fact Check, NewsAPI e, opcionalmente, SerpAPI/Bing para busca geral.
 
     Regra de pontuação global:
@@ -567,6 +1062,8 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
     newsapi_key = ENV.get("NEWSAPI_KEY") or ENV.get("NEWS_API_KEY")
     serpapi_key = ENV.get("SERPAPI_KEY")
     bing_key = ENV.get("BING_SEARCH_KEY")
+    gemini_key = ENV.get("GEMINI_API_KEY") or ENV.get("GOOGLE_GEMINI_API_KEY")
+    entity_block: Dict[str, Any] = {}
 
     details_all: List[Dict[str, Any]] = []
     per_claim_scores: List[float] = []
@@ -592,6 +1089,37 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
         if b_res:
             results.extend(b_res)
 
+        has_fact_rating = any((r.get("rating") or "").strip() for r in results)
+        if not has_fact_rating and gemini_key:
+            gemini_res = query_gemini_factcheck(c, gemini_key, context=results)
+            if gemini_res:
+                verdict_raw = (gemini_res.get("verdict") or "").strip().lower()
+                verdict_map = {
+                    "true": "verdadeiro (Gemini)",
+                    "verdadeiro": "verdadeiro (Gemini)",
+                    "false": "falso (Gemini)",
+                    "falso": "falso (Gemini)",
+                }
+                rating_text = verdict_map.get(verdict_raw, "inconclusivo (Gemini)")
+                conf = gemini_res.get("confidence")
+                try:
+                    conf_val = float(conf)
+                    conf_val = max(0.0, min(1.0, conf_val))
+                except Exception:
+                    conf_val = None
+                results.append({
+                    "provider": "gemini",
+                    "title": "Análise automática Gemini",
+                    "url": "https://ai.google/gemini",
+                    "publisher": "Gemini AI",
+                    "rating": rating_text,
+                    "fact_checker": "Gemini AI",
+                    "claim_text": gemini_res.get("justification") or c,
+                    "gemini_verdict": verdict_raw or "inconclusivo",
+                    "gemini_confidence": conf_val,
+                    "gemini_evidence_used": gemini_res.get("evidence_used"),
+                })
+
         score_c, top = evaluate_claim_against_results(c, results, sbert)
         per_claim_scores.append(score_c)
         details_all.append({
@@ -606,12 +1134,33 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
         time.sleep(0.3)
 
     # Cálculo do score final com divisor fixo 10 (TOP 10 global)
+    fonte_score = 0.0
+    has_true_fact_check = False
+    has_false_fact_check = False
     if global_evidences:
         global_evidences.sort(key=lambda x: x.get("score", 0.0), reverse=True)
         top10_global = global_evidences[:10]
         sum_scores = float(sum(it.get("score", 0.0) for it in top10_global))  # scores em [0,1]
         fonte_score = (sum_scores / 10.0) * 100.0
-    else:
-        fonte_score = 0.0
+        for ev in global_evidences:
+            verdict = _fact_check_verdict(ev.get("rating"))
+            if verdict == "true":
+                has_true_fact_check = True
+            elif verdict == "false":
+                has_false_fact_check = True
+        if has_false_fact_check and not has_true_fact_check:
+            fonte_score = 0.0
+        elif has_false_fact_check and has_true_fact_check:
+            fonte_score = 50.0
 
-    return fonte_score, details_all
+    try:
+        entity_block = verify_entities_with_serpapi(text, serpapi_key)
+    except Exception:
+        logger.exception("Erro ao verificar entidades via SerpAPI")
+        entity_block = {}
+    if entity_block:
+        avg_pct = entity_block.get("media_percent")
+        if isinstance(avg_pct, (int, float)):
+            fonte_score = min(fonte_score, float(avg_pct))
+
+    return fonte_score, details_all, entity_block

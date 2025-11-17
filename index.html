@@ -9,139 +9,245 @@
 </head>
 
 <body>
-  <h1>GoldenFake</h1>
-  <p class="small">
-    Ferramenta experimental de apoio à verificação. Não substitui checagem
-    humana. Forneça uma afirmação ou pequeno texto.
-  </p>
+  <div class="bg-overlay" aria-hidden="true">
+    <div class="scanline"></div>
+    <div class="orb orb-left"></div>
+    <div class="orb orb-right"></div>
+  </div>
 
-  <div class="panel">
-    <div class="flex-between" style="margin-bottom: 0.5rem">
-      <!-- Removido campo API base -->
-      <div class="small">
-        Endpoints: <code>POST /analyze</code> |
-        <code>POST /train_online</code>
+  <header class="hero">
+    <div class="hero__badge">GoldenFake Protocol</div>
+    <h1 class="hero__title">
+      GoldenFake
+    </h1>
+    <div class="hero__meta">
+      <span class="chip">IA + Histórico</span>
+      <span class="chip">Fontes externas</span>
+      <span class="chip">Monitoramento em tempo real</span>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="panel glass">
+      <div class="panel__header">
+        <div>
+          <p class="eyebrow">Entrada
+            prioritária</p>
+          <h2>Envie o texto para análise</h2>
+          <div class="notice" role="note">
+            <strong>Aviso:</strong> para resultados mais robustos, envie textos com pelo menos 512 tokens (aprox.
+            350-400 palavras).
+          </div>
+        </div>
+        <div class="panel__status">
+          <span class="dot"></span>
+          <span>Endpoint ativo</span>
+          <code>POST /analyze</code>
+        </div>
       </div>
-    </div>
 
-    <label
-      style="display: block;font-weight: 600;margin-bottom: 0.5rem;font-size: 0.8rem;text-transform: uppercase;letter-spacing: 0.5px;">Texto
-      para análise</label>
-    <textarea id="text" placeholder="Ex: O Brasil é o maior exportador mundial de café."></textarea>
-    <div class="row" style="margin-top: 0.5rem">
-      <label>k
-        <input id="k" type="number" value="20" min="1" max="100" />
-      </label>
-      <label>Peso histórico
-        <input id="w_hist" type="number" step="0.05" value="0.5" />
-      </label>
-      <label>Peso BERT
-        <input id="w_bert" type="number" step="0.05" value="0.35" />
-      </label>
-      <label>Peso fontes
-        <input id="w_fontes" type="number" step="0.05" value="0.33" />
-      </label>
-      <label>Hist agg
-        <select id="hist_agg">
-          <option>max</option>
-          <option>mean</option>
-        </select>
-      </label>
-      <label>BERT agg
-        <select id="bert_agg">
-          <option>mean</option>
-          <option>max</option>
-        </select>
-      </label>
-    </div>
-    <div class="row">
-      <label>max_tokens
-        <input id="max_tokens" type="number" value="512" />
-      </label>
-      <label>overlap_tokens
-        <input id="overlap_tokens" type="number" value="128" />
-      </label>
-    </div>
-    <div class="flex-between" style="margin-top: 0.75rem">
-      <div>
+      <label class="field-label">Texto para análise</label>
+      <textarea id="text" placeholder="Ex: O Brasil é o maior exportador mundial de café."></textarea>
+
+
+      <div class="advanced-toggle">
+        <button id="toggleAdvanced" class="ghost secondary">Mostrar parâmetros avançados</button>
+        <span class="hint">Ajustes opcionais para controlar blocos, pesos e agregação</span>
+      </div>
+
+      <div id="advancedControls" class="advanced-controls" aria-hidden="true">
+        <div class="control-grid">
+          <div class="control-group">
+            <h3>Como o texto é dividido</h3>
+            <div class="row compact">
+              <label>Quantidade de vizinhos (k)
+                <input id="k" type="number" value="20" min="1" max="100" />
+              </label>
+              <label>Tamanho de cada bloco (tokens)
+                <input id="max_tokens" type="number" value="512" />
+              </label>
+              <label>Sobreposição entre blocos (tokens)
+                <input id="overlap_tokens" type="number" value="128" />
+              </label>
+            </div>
+          </div>
+
+          <div class="control-group">
+            <h3>Como combinamos os sinais</h3>
+            <div class="row compact">
+              <label>Peso do histórico (0 a 1)
+                <input id="w_hist" type="number" step="0.05" value="0.4" />
+              </label>
+              <label>Peso do modelo BERT (0 a 1)
+                <input id="w_bert" type="number" step="0.05" value="0.3" />
+              </label>
+              <label>Peso das fontes externas (0 a 1)
+                <input id="w_fontes" type="number" step="0.05" value="0.3" />
+              </label>
+              <label>Resumo dos blocos históricos
+                <select id="hist_agg">
+                  <option value="max" selected>Mais alto</option>
+                  <option value="mean">Média</option>
+                </select>
+              </label>
+              <label>Resumo dos blocos do BERT
+                <select id="bert_agg">
+                  <option value="mean" selected>Média</option>
+                  <option value="max">Mais alto</option>
+                </select>
+              </label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel__cta">
         <button id="run">Analisar</button>
-        <button id="toggleRaw" style="background: #64748b" disabled>
+        <button id="toggleRaw" class="ghost" disabled>
           Mostrar detalhes
         </button>
+        <span class="hint">Se abrir via file://, o alvo será http://localhost:5000</span>
       </div>
-      <div class="small">
-        Se abrir este arquivo diretamente (file://), a URL padrão será
-        http://localhost:5000
-      </div>
-    </div>
-  </div>
+    </section>
 
-  <div id="summaryArea" style="display: none" class="fade">
-    <div class="card">
-      <h2 style="margin: 0 0 0.75rem; font-size: 1.05rem">Resultados</h2>
-      <div class="results-grid">
-        <div class="metric" id="mHist">
-          <h3>Consistência Histórica</h3>
-          <div class="pct" id="pctHist">--%</div>
-          <div class="bar"><span id="barHist"></span></div>
-          <div class="status" id="stHist"></div>
+    <section id="summaryArea" style="display: none" class="card-deck fade">
+      <div class="card glass">
+        <div class="card__title">
+          <h2>Resultados da análise</h2>
+          <p>Como cada pilar contribuiu para o veredito</p>
         </div>
-        <div class="metric" id="mBert">
-          <h3>BERT (Prob. Verdadeiro)</h3>
-          <div class="pct" id="pctBert">--%</div>
-          <div class="bar"><span id="barBert"></span></div>
-          <div class="status" id="stBert"></div>
+        <div class="results-grid">
+          <div class="metric" id="mHist">
+            <div class="metric__meta">
+              <span class="metric__tag">Registros passados</span>
+              <h3>Similaridade com casos reais</h3>
+            </div>
+            <div class="pct" id="pctHist">--%</div>
+            <div class="bar"><span id="barHist"></span></div>
+            <div class="status" id="stHist"></div>
+          </div>
+          <div class="metric" id="mBert">
+            <div class="metric__meta">
+              <span class="metric__tag">Modelo semântico</span>
+              <h3>Probabilidade de verdadeiro</h3>
+            </div>
+            <div class="pct" id="pctBert">--%</div>
+            <div class="bar"><span id="barBert"></span></div>
+            <div class="status" id="stBert"></div>
+          </div>
+          <div class="metric" id="mFontes">
+            <div class="metric__meta">
+              <span class="metric__tag">Fontes externas</span>
+              <h3>Confirmação em notícias confiáveis</h3>
+            </div>
+            <div class="pct" id="pctFontes">--%</div>
+            <div class="bar"><span id="barFontes"></span></div>
+            <div class="status" id="stFontes"></div>
+          </div>
+          <div class="metric final" id="mFinal">
+            <div class="metric__meta">
+              <span class="metric__tag">Resultado final</span>
+              <h3>Combinação dos três sinais</h3>
+            </div>
+            <div class="pct" id="pctFinal">--%</div>
+            <div class="bar"><span id="barFinal"></span></div>
+            <div class="status" id="stFinal"></div>
+          </div>
         </div>
-        <div class="metric" id="mFontes">
-          <h3>Fontes Externas</h3>
-          <div class="pct" id="pctFontes">--%</div>
-          <div class="bar"><span id="barFontes"></span></div>
-          <div class="status" id="stFontes"></div>
-        </div>
-        <div class="metric final" id="mFinal" style="grid-column: span 1">
-          <h3>Média / Score Final</h3>
-          <div class="pct" id="pctFinal">--%</div>
-          <div class="bar"><span id="barFinal"></span></div>
-          <div class="status" id="stFinal"></div>
-        </div>
+        <p class="small">
+          As porcentagens combinam histórico, modelo e fontes. Use como sinal inicial, não como veredicto absoluto.
+        </p>
       </div>
-      <p class="small" style="margin-top: 1rem">
-        As porcentagens resultam de três sinais combinados pelos pesos
-        definidos. Use como indicação inicial, não veredicto definitivo.
-      </p>
-    </div>
 
-    <div class="card" id="chartCard">
-      <h2 style="margin: 0 0 0.75rem; font-size: 1.05rem">
-        Gráfico de pizza das porcentagens
-      </h2>
-      <div class="chart-wrap">
-        <canvas id="pieChart"></canvas>
+      <div class="card glass" id="chartCard">
+        <div class="card__title">
+          <h2>Distribuição dos sinais</h2>
+          <p>Visualização circular dos pesos aplicados</p>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="pieChart"></canvas>
+        </div>
+        <div id="pieFallback" class="small" style="display: none; color: #a2a2a2">
+          Não foi possível carregar o gráfico.
+        </div>
       </div>
-      <div id="pieFallback" class="small" style="display: none; color: #64748b">
-        Não foi possível carregar o gráfico.
-      </div>
-    </div>
 
-    <div class="card" id="sourcesCard" style="display: none">
-      <h2 style="margin: 0 0 0.75rem; font-size: 1.05rem">
-        Fontes externas (individuais)
-      </h2>
-      <div class="small">
-        Percentual final por evidência considerada. Clique no título para
-        abrir.
+      <div class="card glass" id="comparisonCard">
+        <div class="card__title">
+          <h2>Comparativo dos pilares</h2>
+          <p>Barras horizontais com a força de cada sinal</p>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="barChart"></canvas>
+        </div>
+        <div id="barFallback" class="small" style="display: none; color: #a2a2a2">
+          Não foi possível carregar o gráfico.
+        </div>
       </div>
-      <div class="sources-list" id="sourcesList"></div>
-    </div>
-  </div>
 
-  <div id="detailsBox" class="card fade">
-    <div class="flex-between" style="margin-bottom: 0.5rem">
-      <strong>Detalhes completos (JSON)</strong>
-      <button id="closeRaw" style="background: #e11d48">Fechar</button>
-    </div>
-    <pre id="out">{}</pre>
-  </div>
+      <div class="card glass" id="sourcesCard" style="display: none">
+        <div class="card__title center">
+          <h2>Fontes externas</h2>
+          <p>Top evidências consideradas</p>
+        </div>
+        <div class="chart-grid">
+          <div class="chart-wrap tall">
+            <canvas id="sourcePie"></canvas>
+            <div id="sourcePieFallback" class="small" style="display: none; color: #a2a2a2">
+              Não foi possível carregar o gráfico.
+            </div>
+          </div>
+          <div class="chart-wrap tall">
+            <canvas id="sourceBar"></canvas>
+            <div id="sourceBarFallback" class="small" style="display: none; color: #a2a2a2">
+              Não foi possível carregar o gráfico.
+            </div>
+          </div>
+        </div>
+        <div class="sources-section">
+          <h3>Verificações e notícias</h3>
+          <div class="sources-list" id="sourcesList"></div>
+        </div>
+        <div class="sources-section" id="entityBlock" style="display: none">
+          <div class="entity-header">
+            <h3>Verificação de entidades</h3>
+            <p class="small" id="entitySummary"></p>
+          </div>
+          <div class="entity-list" id="entityList"></div>
+        </div>
+        <div class="sources-section" id="wikiSourcesBlock" style="display: none">
+          <div class="wiki-header">
+            <h3>Artigos similares na Wikipedia</h3>
+            <p class="small" id="wikiSourcesMeta"></p>
+          </div>
+          <div class="wiki-visuals">
+            <div class="chart-wrap tall">
+              <canvas id="wikiCategoryChart"></canvas>
+              <div id="wikiCategoryFallback" class="small" style="display: none; color: #a2a2a2">
+                Não foi possível carregar o gráfico.
+              </div>
+            </div>
+            <div class="wiki-related">
+              <h4>Títulos relacionados por categoria</h4>
+              <div class="wiki-related-list" id="wikiCategoryList"></div>
+            </div>
+          </div>
+          <div class="sources-list compact" id="wikiSourcesList"></div>
+        </div>
+      </div>
+    </section>
+
+    <section id="detailsBox" class="card glass fade">
+      <div class="card__title flex-between details-toolbar">
+        <div class="details-header">
+          <h2>Payload bruto</h2>
+          <p>JSON completo retornado pela API</p>
+        </div>
+        <button id="closeRaw" class="danger">Fechar</button>
+      </div>
+      <pre id="out">{}</pre>
+    </section>
+  </main>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <script src="/static/script.js"></script>
