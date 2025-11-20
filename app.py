@@ -14,6 +14,7 @@ from fact_checker import (
     load_online_adaptor,
     combined_historical_consistency_for_text,
     blend_score_with_entities,
+    faiss_claim_corroboration,
     ENTITY_BERT_WEIGHT,
 )
 from external_sources import verify_with_external_sources
@@ -25,6 +26,38 @@ WIKI_SIMILARITY_THRESHOLD = 0.7
 WIKI_REQUEST_HEADERS = {
     "User-Agent": "GoldenFake/1.0 (+https://github.com/JPeeeedrs/goldenfake)"
 }
+WIKI_CATEGORY_EXCLUDE_PREFIXES = (
+    "artigo",
+    "artigos",
+    "página",
+    "páginas",
+    "pagina",
+    "paginas",
+    "lista",
+    "listas",
+    "wikipédia",
+    "wikipedia",
+    "wikiprojeto",
+    "cs1",
+    "!",
+    "todos os artigos",
+    "predefinições",
+    "predefinicoes",
+)
+WIKI_CATEGORY_EXCLUDE_SUBSTRINGS = (
+    "wikificação",
+    "wikificacao",
+    "manutenção",
+    "manutencao",
+    "fontes",
+    "cs1",
+    "stub",
+    "esboço",
+    "esboco",
+    "ajuda",
+    "artigo destacado",
+    "artigos destacados",
+)
 _WIKI_INFO_CACHE: dict[str, dict] = {}
 
 app = Flask(__name__, static_folder='static')
@@ -108,16 +141,18 @@ def _flatten_external_evidence(details):
                     if token in rating_text:
                         is_false_fact_check = True
                         break
-            # Force percent to 70.0 for wiki sources
-            if "wiki" in tags:
-                pct = 70.0
-            elif is_false_fact_check:
-                pct = 0.0
-            else:
+            sim = ev.get("similaridade")
+            try:
+                pct = round(float(sim) * 100.0, 1) if sim is not None else None
+            except Exception:
+                pct = None
+            if pct is None and sc is not None:
                 try:
                     pct = round(float(sc) * 100.0, 1)
                 except Exception:
-                    continue
+                    pct = None
+            if pct is None:
+                pct = 0.0
             rating = ev.get("rating")
             fc_flag = bool(ev.get("fact_checker")) or (
                 isinstance(rating, str) and "fact-check" in rating.lower())
@@ -136,7 +171,7 @@ def _flatten_external_evidence(details):
                 "publisher": ev.get("publisher"),
                 "provider": ev.get("provider"),
                 "percent": pct,
-                "similaridade": ev.get("similaridade"),
+                "similaridade": sim,
                 "confianca_fonte": ev.get("confianca_fonte"),
                 "overlap_bucket": ev.get("overlap_bucket") or (
                     ">=50%" if ev.get("passes_50pct") else (
@@ -152,8 +187,9 @@ def _flatten_external_evidence(details):
                 "gemini_confidence": ev.get("gemini_confidence"),
                 "gemini_evidence_used": ev.get("gemini_evidence_used"),
                 "gemini_veredito": ev.get("gemini_verdict") or verdict,
+                "gemini_percent_true": ev.get("percent_true"),
             })
-    items.sort(key=lambda x: x.get("percent", 0), reverse=True)
+    items.sort(key=lambda x: x.get("percent") or 0, reverse=True)
     return items
 
 
@@ -168,6 +204,35 @@ def _normalize_category_title(title: str | None) -> str | None:
     if title.startswith("Categoria:"):
         return title.split(":", 1)[-1]
     return title
+
+
+def _clean_wiki_categories(categories: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for cat in categories or []:
+        if not cat:
+            continue
+        norm = cat.strip()
+        if not norm:
+            continue
+        lower = norm.lower()
+        skip = False
+        for prefix in WIKI_CATEGORY_EXCLUDE_PREFIXES:
+            if lower.startswith(prefix):
+                skip = True
+                break
+        if not skip:
+            for token in WIKI_CATEGORY_EXCLUDE_SUBSTRINGS:
+                if token in lower:
+                    skip = True
+                    break
+        if skip:
+            continue
+        cleaned.append(norm)
+        if len(cleaned) >= 6:
+            break
+    if not cleaned:
+        return (categories or [])[:3]
+    return cleaned
 
 
 def _clamp_wiki_limit(k: int | None, wiki_titles: int | None) -> int:
@@ -208,6 +273,7 @@ def _fetch_wikipedia_metadata(page_ids: list[str]) -> dict[str, dict]:
                     norm = _normalize_category_title(cat.get("title"))
                     if norm:
                         cats.append(norm)
+                cats = _clean_wiki_categories(cats)
                 _WIKI_INFO_CACHE[pid] = {
                     "title": data.get("title"),
                     "displaytitle": data.get("displaytitle"),
@@ -224,10 +290,12 @@ def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
                         similarity_threshold=WIKI_SIMILARITY_THRESHOLD):
     section = {
         "artigos_wikipedia_similares": [],
+    "categorias_expandido": {},
         "total_encontrado": 0,
         "limite_exibido": 0,
         "limite_configurado": limit,
         "limiar_similaridade": similarity_threshold,
+        "relaxado_por_falta": False,
     }
     if not neighbors or not metadata:
         return section
@@ -252,6 +320,10 @@ def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
 
     sorted_articles = sorted(best_by_article.items(), key=lambda x: x[1], reverse=True)
     filtered = [(aid, score) for aid, score in sorted_articles if score >= similarity_threshold]
+    if not filtered:
+        # relaxar limiar se nada atingir o threshold, mas registrar para o frontend
+        filtered = sorted_articles[:limit]
+        section["relaxado_por_falta"] = True
     section["total_encontrado"] = len(filtered)
     top = filtered[:limit]
     section["limite_exibido"] = len(top)
@@ -272,7 +344,107 @@ def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
             "url": info.get("fullurl") or f"https://pt.wikipedia.org/?curid={aid}",
         })
     section["artigos_wikipedia_similares"] = articles
+    cat_map: dict[str, list[dict]] = {}
+    for art in articles:
+        cats = art.get("categorias") or []
+        if not cats:
+            cat_map.setdefault("Sem categoria", []).append(art)
+            continue
+        for cat in cats:
+            cat_map.setdefault(cat, []).append(art)
+    # ordenar artigos em cada categoria por similaridade
+    for cat, items in cat_map.items():
+        items.sort(key=lambda x: x.get("similaridade", 0), reverse=True)
+    section["categorias_expandido"] = cat_map
     return section
+
+
+def _build_frontend_view(payload: dict) -> dict:
+    confirm = payload.get("confirmacao_fontes") or {}
+    fontes_individuais = confirm.get("fontes_individuais") or []
+    entidades_block = confirm.get("entidades_verificadas") or {}
+    wiki_section = payload.get("fontes_externas") or {}
+    historico = payload.get("historico") or {}
+    bert_block = payload.get("bert") or {}
+    final_block = payload.get("final") or {}
+
+    evidencias_principais = []
+    for item in fontes_individuais[:8]:
+        evidencias_principais.append({
+            "title": item.get("title"),
+            "url": item.get("url"),
+            "publisher": item.get("publisher"),
+            "provider": item.get("provider"),
+            "percent": item.get("percent"),
+            "tags": item.get("source_tags"),
+        })
+
+    entidades_lista = []
+    for ent in entidades_block.get("entidades") or []:
+        entidades_lista.append({
+            "entidade": ent.get("entidade"),
+            "status": ent.get("status"),
+            "rotulo": ent.get("rotulo"),
+            "score": ent.get("score"),
+            "provider": ent.get("provider"),
+        })
+
+    nivelamento = []
+    for det in confirm.get("detalhes") or []:
+        gem = det.get("gemini_investigativo") or {}
+        nivelamento.append({
+            "afirmacao": det.get("afirmacao"),
+            "nivel": det.get("nivel"),
+            "score_afirmacao": det.get("score_afirmacao"),
+            "nivel1_total": det.get("nivel1_total"),
+            "nivel2_total": det.get("nivel2_total"),
+            "gemini_percent_true": gem.get("percent_true"),
+        })
+
+    return {
+        "texto_analisado": payload.get("texto_analisado"),
+        "score_final": final_block.get("score"),
+        "rotulo_final": final_block.get("rotulo"),
+        "componentes": {
+            "historico": {
+                "consistencia": historico.get("consistencia"),
+                "aggregate": historico.get("aggregate"),
+                "k": historico.get("k"),
+            },
+            "bert": {
+                "rotulo": bert_block.get("rotulo"),
+                "prob_true": bert_block.get("prob_true"),
+                "entity_avg_percent": bert_block.get("entity_avg_percent"),
+            },
+            "fontes": {
+                "fonte_score": confirm.get("fonte_score"),
+                "total_fontes": len(fontes_individuais),
+                "nivelamento": nivelamento,
+            },
+        },
+        "fontes": {
+            "evidencias_principais": evidencias_principais,
+            "entidades": {
+                "resumo": {
+                    "total": entidades_block.get("total"),
+                    "fortes": entidades_block.get("fortes"),
+                    "fracas": entidades_block.get("fracas"),
+                    "ausentes": entidades_block.get("ausentes"),
+                    "media_percent": entidades_block.get("media_percent"),
+                },
+                "lista": entidades_lista,
+            },
+        },
+        "wikipedia": {
+            "total_encontrado": wiki_section.get("total_encontrado"),
+            "limite_exibido": wiki_section.get("limite_exibido"),
+            "artigos": wiki_section.get("artigos_wikipedia_similares"),
+        },
+        "parametros": {
+            "pesos": payload.get("pesos"),
+            "chunking": payload.get("chunking"),
+        },
+    }
 
 
 def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_fontes: float,
@@ -297,11 +469,26 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             w_faiss=w_faiss,
             w_wiki=w_wiki,
         )
-        neighbors = hist_info.get("faiss", {}).get("vizinhos", [])
+        neighbors = hist_info.get("faiss", {}).get("vizinhos") or []
     else:
         hist_score, neighbors = historical_consistency_for_text(
             INDEX, SBERT, text, k=k, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=hist_agg
         )
+
+    faiss_corroboration = faiss_claim_corroboration(neighbors, METADATA, text)
+    hist_score_raw = hist_score
+    corroboration_multiplier = None
+    if faiss_corroboration:
+        corroboration_multiplier = faiss_corroboration.get("corroboration_score")
+        if corroboration_multiplier is not None:
+            try:
+                multiplier = float(corroboration_multiplier)
+            except (TypeError, ValueError):
+                multiplier = None
+            if multiplier is not None:
+                multiplier = max(0.0, min(1.0, multiplier))
+                hist_score = hist_score * multiplier
+                corroboration_multiplier = multiplier
 
     bert_score_true_raw = bert_probability_true_for_text(
         CLF, LE, SBERT, CCFG, text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg
@@ -332,6 +519,7 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
 
     historico_block = {
         "consistencia": round(hist_score, 1),
+        "consistencia_raw": round(hist_score_raw, 1),
         "k": k,
         "aggregate": hist_agg,
     }
@@ -343,6 +531,10 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
         })
     else:
         historico_block["vizinhos"] = neighbors
+    if faiss_corroboration:
+        historico_block["corroboracao"] = faiss_corroboration
+    if corroboration_multiplier is not None:
+        historico_block["corroboracao_multiplicador"] = round(float(corroboration_multiplier), 4)
 
     payload = {
         "texto_analisado": text,
@@ -381,6 +573,8 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             "overlap_tokens": overlap_tokens,
         },
     }
+    if faiss_corroboration:
+        payload["faiss_corroboracao"] = faiss_corroboration
     wiki_section = _build_wiki_sources(neighbors, METADATA, limit=wiki_limit)
     payload["fontes_externas"] = wiki_section
     payload["wikipedia"] = {
@@ -388,6 +582,7 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
         "score": (hist_info.get("wikipedia", {}).get("score") if use_wiki else None),
         "titles_limit": wiki_limit,
     }
+    payload["frontend_view"] = _build_frontend_view(payload)
     return payload, 200
 
 

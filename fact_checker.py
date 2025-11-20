@@ -5,8 +5,17 @@ import numpy as np
 import faiss
 import joblib
 import re
+import unicodedata
 import requests
+from functools import lru_cache
 from typing import Any, Dict, List, Tuple
+
+try:  # spaCy é opcional em runtime
+    import spacy  # type: ignore
+except Exception:  # pragma: no cover
+    spacy = None  # type: ignore
+
+_SPACY_NLP = None
 from sentence_transformers import SentenceTransformer
 from external_sources import verify_with_external_sources
 
@@ -116,23 +125,19 @@ class OnlineAdaptiveClassifier:
         X = self._embed_texts_with_style(texts)
         self._ensure_init()
         if not self.is_trained():
-            # primeira chamada precisa de classes
             try:
                 self.inc_clf.partial_fit(X, y_idx, classes=self._classes_idx)
             except Exception:
-                # fallback sem weights
                 self.inc_clf.partial_fit(X, y_idx, classes=self._classes_idx)
         else:
             try:
                 if sample_weight is not None and getattr(self.inc_clf, "partial_fit", None):
-                    self.inc_clf.partial_fit(
-                        X, y_idx, sample_weight=sample_weight)
+                    self.inc_clf.partial_fit(X, y_idx, sample_weight=sample_weight)
                 else:
                     self.inc_clf.partial_fit(X, y_idx)
             except TypeError:
                 self.inc_clf.partial_fit(X, y_idx)
         self.n_updates += len(texts)
-        # persistir
         self.save()
         return True
 
@@ -144,7 +149,6 @@ class OnlineAdaptiveClassifier:
             P = self.inc_clf.predict_proba(X)
         except Exception:
             return None
-        # probabilidade da classe "true" segundo label encoder
         try:
             idx_true = list(self.le.classes_).index("true")
         except ValueError:
@@ -692,6 +696,371 @@ def combined_historical_consistency_for_text(index, model: SentenceTransformer, 
         "pesos": {"faiss": round(wf, 2), "wikipedia": round(ww, 2)},
     }
 
+
+WIKI_EXTRACT_URL = "https://pt.wikipedia.org/w/api.php"
+WIKI_PAGE_URL_TEMPLATE = "https://pt.wikipedia.org/?curid={page_id}"
+WIKI_EXTRACT_HEADERS = {
+    "User-Agent": "GoldenFake/1.0 (+https://github.com/JPeeeedrs/goldenfake)"
+}
+
+_STOPWORDS = {
+    "a", "ao", "aos", "aquela", "aquele", "as", "com", "como", "da", "das", "de",
+    "do", "dos", "e", "em", "entre", "era", "essa", "esse", "estao", "esta",
+    "estar", "foi", "ha", "isso", "isto", "ja", "mais", "mas", "na", "nas", "no",
+    "nos", "nossa", "neste", "o", "os", "para", "pela", "pelas", "pelo", "pelos",
+    "por", "que", "se", "sem", "ser", "sua", "são", "tambem", "tem", "uma",
+    "umas", "uns", "vai", "via", "voc", "voce", "sou", "somos", "sao", "estamos",
+    "estao", "eram", "serao", "seria", "seriam", "teria", "teriam", "tiveram",
+    "havia", "haviam", "existem", "existe", "existia", "existiu", "cria", "criar",
+    "criam", "criou", "criando", "feito", "fazer", "faz", "fazia", "fazem", "feito",
+    "feito", "feitos", "muito", "pouco", "tudo", "todos", "todas", "cada", "outra",
+    "outro", "outros", "outras", "sempre", "nunca", "the", "and", "this", "that",
+    "who", "when", "where", "from", "into", "you"
+}
+
+_GENERIC_ENTITY_TOKENS = {
+    "governo", "sociedade", "economistas", "analistas", "pessoas", "ano", "anos",
+    "problema", "crise", "escandalo", "rombo", "situacao", "pais", "populacao",
+    "setor", "mercado", "empresa", "empresas", "politica", "economia", "reforma",
+    "programa", "beneficio", "pagamento", "trabalhadores", "federal", "nacional",
+    "publico", "privado", "setor privado", "setor publico",
+}
+
+CORROBORATION_LOW_THRESHOLD = 0.3  # legacy constants (mantidos para tuning futuro, atualmente não usados)
+CORROBORATION_LOW_PENALTY = 0.5
+
+
+def _get_spacy_model():
+    global _SPACY_NLP
+    if _SPACY_NLP is not None:
+        return _SPACY_NLP
+    if spacy is None:  # type: ignore
+        _SPACY_NLP = None
+        return None
+    try:
+        _SPACY_NLP = spacy.load("pt_core_news_sm")  # type: ignore
+    except Exception:
+        _SPACY_NLP = None
+    return _SPACY_NLP
+
+
+def _extract_entities(text: str | None,
+                      allowed_labels: set[str] | None = None) -> set[str]:
+    if not text:
+        return set()
+    nlp = _get_spacy_model()
+
+    if nlp is None:
+        return _fallback_entity_candidates(text)
+
+    try:
+        doc = nlp(text)
+    except Exception:
+        return set()
+
+    allowed = allowed_labels or {
+        "PER", "ORG", "LOC", "GPE", "FAC", "PRODUCT", "EVENT", "WORK_OF_ART",
+        "LAW", "LANGUAGE", "NORP", "PERSON", "ORGANIZATION", "LOCATION",
+    }
+
+    spacy_entities: set[str] = set()
+    for ent in doc.ents:
+        label = ent.label_ or ""
+        if allowed and label not in allowed:
+            continue
+        normalized = _normalize_text_for_match(ent.text)
+        if not _should_keep_entity(normalized):
+            continue
+        spacy_entities.add(normalized)
+
+    if len(spacy_entities) >= 3:
+        return spacy_entities
+
+    fallback_candidates = _fallback_entity_candidates(text)
+    return spacy_entities | fallback_candidates
+
+
+def _should_keep_entity(token: str | None) -> bool:
+    if not token:
+        return False
+    if token in _STOPWORDS or token in _GENERIC_ENTITY_TOKENS:
+        return False
+    if token.replace(" ", "").isdigit():
+        return False
+    if len(token) <= 2:
+        return False
+    return True
+
+
+def _fallback_entity_candidates(text: str | None) -> set[str]:
+    if not text:
+        return set()
+    candidates: set[str] = set()
+    for raw, norm in _tokenize_claim(text):
+        if not _should_keep_entity(norm):
+            continue
+        if raw.isupper() or raw[:1].isupper():
+            candidates.add(norm)
+        if len(candidates) >= 12:
+            break
+    return candidates
+
+
+def _normalize_text_for_match(text: str | None) -> str:
+    if not text:
+        return ""
+    normalized = unicodedata.normalize("NFKD", text)
+    stripped = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return stripped.lower()
+
+
+def _tokenize_claim(text: str | None) -> list[tuple[str, str]]:
+    tokens: list[tuple[str, str]] = []
+    for raw in re.findall(r"\b[\w\-]+\b", text or "", flags=re.UNICODE):
+        norm = _normalize_text_for_match(raw)
+        if norm:
+            tokens.append((raw, norm))
+    return tokens
+
+
+def _score_tokens(tokens: list[tuple[str, str]]) -> list[tuple[float, str, str]]:
+    scored: list[tuple[float, str, str]] = []
+    fallback: list[tuple[float, str, str]] = []
+    for raw, norm in tokens:
+        base = len(norm)
+        if base == 0:
+            continue
+        boost = 0.0
+        if any(ch.isdigit() for ch in raw):
+            boost += 2.5
+        if "-" in raw:
+            boost += 1.0
+        score = base + boost
+        if norm in _STOPWORDS or base <= 3:
+            fallback.append((max(1.0, score * 0.5), norm, raw))
+        else:
+            scored.append((score, norm, raw))
+    if not scored:
+        scored = fallback
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return scored
+
+
+def extract_claim_keywords(text: str | None,
+                           max_terms: int = 8,
+                           max_phrases: int = 3) -> list[dict[str, str | float]]:
+    tokens = _tokenize_claim(text or "")
+    ranked = _score_tokens(tokens)
+    keywords: list[dict[str, str | float]] = []
+    seen: set[str] = set()
+    for score, norm, raw in ranked:
+        if not norm or norm in seen:
+            continue
+        keywords.append({
+            "token": raw,
+            "normalized": norm,
+            "score": round(float(score), 2),
+        })
+        seen.add(norm)
+        if len(keywords) >= max_terms:
+            break
+
+    phrase_candidates: list[tuple[float, str, str]] = []
+    for i in range(len(tokens) - 1):
+        raw1, norm1 = tokens[i]
+        raw2, norm2 = tokens[i + 1]
+        if norm1 in _STOPWORDS or norm2 in _STOPWORDS:
+            continue
+        phrase_norm = f"{norm1} {norm2}"
+        if len(phrase_norm) <= 7:
+            continue
+        phrase_raw = f"{raw1} {raw2}"
+        phrase_score = len(norm1) + len(norm2) + 1.0
+        phrase_candidates.append((phrase_score, phrase_norm, phrase_raw))
+    phrase_candidates.sort(key=lambda item: (-item[0], item[1]))
+
+    added = 0
+    for score, norm, raw in phrase_candidates:
+        if norm in seen:
+            continue
+        keywords.append({
+            "token": raw,
+            "normalized": norm,
+            "score": round(float(score), 2),
+            "is_phrase": True,
+        })
+        seen.add(norm)
+        added += 1
+        if added >= max_phrases:
+            break
+
+    return keywords
+
+
+@lru_cache(maxsize=4096)
+def fetch_wikipedia_article(page_id: str | int) -> dict | None:
+    pid = str(page_id)
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "explaintext": 1,
+        "pageids": pid,
+    }
+    try:
+        resp = requests.get(WIKI_EXTRACT_URL, params=params,
+                            headers=WIKI_EXTRACT_HEADERS, timeout=4)
+        resp.raise_for_status()
+        data = resp.json().get("query", {}).get("pages", {})
+        page = data.get(pid)
+        if not page or page.get("missing") is not None:
+            return None
+        return {
+            "id": pid,
+            "title": page.get("title"),
+            "text": page.get("extract") or "",
+            "url": WIKI_PAGE_URL_TEMPLATE.format(page_id=pid),
+        }
+    except Exception:
+        return None
+
+
+def _match_keywords(article_text: str, keywords: list[dict[str, str | float]]):
+    normalized_article = _normalize_text_for_match(article_text)
+    matched: list[str] = []
+    missing: list[str] = []
+    for kw in keywords:
+        norm_kw = kw.get("normalized")
+        token = kw.get("token")
+        if not norm_kw or not token:
+            continue
+        if norm_kw in normalized_article:
+            matched.append(str(token))
+        else:
+            missing.append(str(token))
+    if not keywords:
+        status = "insufficient_keywords"
+    elif matched:
+        status = "corroborated"
+    else:
+        status = "not_corroborated"
+    return {
+        "status": status,
+        "matched_keywords": matched,
+        "missing_keywords": missing,
+    }
+
+
+def _is_fuzzy_match(entity_a: str | None, entity_b: str | None) -> bool:
+    a = (entity_a or "").strip().lower()
+    b = (entity_b or "").strip().lower()
+    if not a or not b:
+        return False
+    return a in b or b in a
+
+
+def faiss_claim_corroboration(neighbors: list[tuple[int, float]],
+                              metadata: list[dict],
+                              claim_text: str,
+                              top_articles: int = 3) -> dict | None:
+    if not neighbors or not metadata:
+        return None
+    keywords = extract_claim_keywords(claim_text)
+    query_entities = _extract_entities(claim_text)
+    total_query_ents = len(query_entities)
+    results: list[dict] = []
+    overall_status = "insufficient_keywords" if not keywords else "not_corroborated"
+    best_corroboration = 0.0
+
+    for neighbor in neighbors[:top_articles]:
+        idx, similarity = neighbor
+        if idx is None or idx < 0 or idx >= len(metadata):
+            continue
+        entry = metadata[idx] or {}
+        page_id = entry.get("id")
+        if not page_id:
+            continue
+        chunk_index = entry.get("chunk_index")
+        article = fetch_wikipedia_article(str(page_id))
+        if not article:
+            results.append({
+                "page_id": str(page_id),
+                "chunk_index": chunk_index,
+                "similaridade": round(float(similarity or 0.0), 3),
+                "status": "unavailable",
+            })
+            continue
+
+        article_text = article.get("text", "") or ""
+        match = _match_keywords(article_text, keywords)
+        article_entities = _extract_entities(article_text, None)
+        article_text_lower = article_text.lower()
+
+        matched_entities: set[str] = set()
+        if query_entities:
+            for q_ent in query_entities:
+                found = False
+                for a_ent in article_entities:
+                    if _is_fuzzy_match(q_ent, a_ent):
+                        matched_entities.add(q_ent)
+                        found = True
+                        break
+                if not found and q_ent.lower() in article_text_lower:
+                    matched_entities.add(q_ent)
+
+        missing_entities = sorted(list(query_entities - matched_entities)) if query_entities else []
+        matched_list = sorted(list(matched_entities)) if matched_entities else []
+
+        ratio = 0.0
+        if total_query_ents > 0:
+            matched_count = len(matched_entities)
+            ratio = matched_count / total_query_ents
+            if ratio > 0.5:
+                ratio = min(1.0, ratio * 1.2)
+        corroboration_ratio = round(float(ratio), 4) if total_query_ents else None
+
+        if ratio > best_corroboration:
+            best_corroboration = ratio
+
+        current_status = "not_corroborated"
+        if ratio >= 0.6:
+            current_status = "corroborated"
+        elif ratio >= 0.3:
+            current_status = "partially_corroborated"
+
+        results.append({
+            "page_id": str(page_id),
+            "title": article.get("title"),
+            "url": article.get("url"),
+            "chunk_index": chunk_index,
+            "similaridade": round(float(similarity or 0.0), 3),
+            "status": current_status,
+            "matched_keywords": match.get("matched_keywords"),
+            "missing_keywords": match.get("missing_keywords"),
+            "matched_entities": matched_list,
+            "missing_entities": missing_entities,
+            "article_entities": sorted(article_entities),
+            "corroboration_ratio": corroboration_ratio,
+        })
+
+        if current_status == "corroborated":
+            overall_status = "corroborated"
+        elif current_status == "partially_corroborated" and overall_status != "corroborated":
+            overall_status = "partially_corroborated"
+
+    if total_query_ents == 0:
+        best_corroboration = 1.0
+
+    if overall_status != "corroborated" and best_corroboration > 0.5:
+        overall_status = "partially_corroborated"
+
+    return {
+        "status": overall_status,
+        "keywords": keywords,
+        "query_entities": sorted(query_entities),
+        "corroboration_score": round(float(best_corroboration), 4),
+        "articles": results,
+    }
 
 def main():
     parser = argparse.ArgumentParser(

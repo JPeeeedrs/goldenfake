@@ -3,6 +3,10 @@ const fmt = (v) =>
 	v === null || v === undefined || isNaN(v)
 		? "--"
 		: Math.round(v * 10) / 10 + "%";
+const fmtRatio = (ratio) =>
+	ratio === null || ratio === undefined || isNaN(ratio)
+		? "--"
+		: `${(ratio * 100).toFixed(1)}%`;
 
 const DEFAULT_PARAMS = {
 	k: 20,
@@ -32,6 +36,7 @@ let wikiCategoryChart = null;
 let hasSourceList = false;
 let hasWikiList = false;
 let hasEntityList = false;
+let copyFeedbackTimer = null;
 const pieColors = ["#0ea5e9", "#22c55e", "#f59e0b"]; // 3 cores (Histórico, BERT, Fontes)
 const barColors = ["#38bdf8", "#34d399", "#fbbf24", "#f97316"];
 const sourceColors = ["#fbbf24", "#38bdf8", "#a855f7", "#22d3ee", "#fb7185"];
@@ -205,6 +210,43 @@ function toggleDetails(show) {
 	el("toggleRaw").textContent = show ? "Ocultar detalhes" : "Mostrar detalhes";
 }
 
+async function copyRawJson() {
+	const btn = el("copyRaw");
+	const target = el("out");
+	if (!btn || !target) return;
+	const payload = target.textContent || "";
+	if (!payload.trim()) return;
+	const original = btn.textContent || "Copiar JSON";
+	const showFeedback = (msg) => {
+		btn.textContent = msg;
+		clearTimeout(copyFeedbackTimer);
+		copyFeedbackTimer = setTimeout(() => {
+			btn.textContent = original;
+			btn.disabled = false;
+		}, 1500);
+	};
+	btn.disabled = true;
+	try {
+		if (navigator.clipboard?.writeText) {
+			await navigator.clipboard.writeText(payload);
+		} else {
+			const temp = document.createElement("textarea");
+			temp.value = payload;
+			temp.style.position = "fixed";
+			temp.style.opacity = "0";
+			document.body.appendChild(temp);
+			temp.focus();
+			temp.select();
+			document.execCommand("copy");
+			document.body.removeChild(temp);
+		}
+		showFeedback("Copiado!");
+	} catch (err) {
+		console.error("Falha ao copiar JSON", err);
+		showFeedback("Erro ao copiar");
+	}
+}
+
 function getApiBase() {
 	return window.location.origin;
 }
@@ -237,10 +279,21 @@ function renderSources(list) {
 		title.textContent = item.title || item.url || "(sem título)";
 		const meta = document.createElement("div");
 		meta.className = "meta";
-		meta.textContent =
+		const baseMeta =
 			(item.publisher || item.provider || "fonte") +
-			" • " +
-			(item.overlap_bucket || "");
+			(item.overlap_bucket ? " • " + item.overlap_bucket : "");
+		const simLabel =
+			typeof item.percent === "number"
+				? `${item.percent.toFixed(1)}% similar`
+				: null;
+		const geminiLabel =
+			typeof item.gemini_percent_true === "number"
+				? `Gemini ${item.gemini_percent_true.toFixed(1)}%`
+				: null;
+		const percentLabel = [simLabel, geminiLabel].filter(Boolean).join(" • ");
+		meta.textContent = percentLabel
+			? `${baseMeta} • ${percentLabel}`
+			: baseMeta;
 		const tags = Array.isArray(item.source_tags) ? item.source_tags : [];
 		tags.forEach((tg) => {
 			const b = document.createElement("span");
@@ -254,15 +307,24 @@ function renderSources(list) {
 
 		const right = document.createElement("div");
 		right.className = "percent";
-		right.textContent =
-			(item.percent != null ? item.percent.toFixed(1) : "--") + "%";
+		const rightParts = [];
+		if (typeof item.percent === "number" && !Number.isNaN(item.percent)) {
+			rightParts.push(`${item.percent.toFixed(1)}% similaridade`);
+		}
+		if (
+			typeof item.gemini_percent_true === "number" &&
+			!Number.isNaN(item.gemini_percent_true)
+		) {
+			rightParts.push(`Gemini ${item.gemini_percent_true.toFixed(1)}%`);
+		}
+		right.textContent = rightParts.length ? rightParts.join(" | ") : "--";
 
 		row.appendChild(left);
 		row.appendChild(right);
 		const tipTags = tags && tags.length ? ` | tags: ${tags.join(", ")}` : "";
-		row.title = `similaridade: ${item.similaridade ?? "--"} | confiança: ${
-			item.confianca_fonte ?? "--"
-		}${tipTags}`;
+		row.title = `similaridade: ${
+			typeof item.percent === "number" ? item.percent.toFixed(1) + "%" : "--"
+		} | confiança: ${item.confianca_fonte ?? "--"}${tipTags}`;
 		row.onclick = () => {
 			if (item.url) {
 				window.open(item.url, "_blank");
@@ -272,6 +334,55 @@ function renderSources(list) {
 	});
 	updateSourceCharts(list);
 	updateSourcesCardVisibility();
+}
+
+function renderCorroborationNote(rawHist, adjHist, multiplier, corrobBlock) {
+	const note = el("histCorrNote");
+	if (!note) return;
+	const hasMultiplier = typeof multiplier === "number" && isFinite(multiplier);
+	const rawTxt =
+		typeof rawHist === "number" && isFinite(rawHist) ? fmt(rawHist) : "--";
+	const adjTxt =
+		typeof adjHist === "number" && isFinite(adjHist) ? fmt(adjHist) : "--";
+	const queryEntities = Array.isArray(corrobBlock?.query_entities)
+		? corrobBlock.query_entities
+		: [];
+	const bestArticle = Array.isArray(corrobBlock?.articles)
+		? corrobBlock.articles.find(
+				(art) =>
+					Array.isArray(art?.matched_entities) && art.matched_entities.length
+		  ) || corrobBlock.articles[0]
+		: null;
+	const matchedEntities = Array.isArray(bestArticle?.matched_entities)
+		? bestArticle.matched_entities
+		: [];
+	const missingEntities = Array.isArray(bestArticle?.missing_entities)
+		? bestArticle.missing_entities
+		: [];
+	if (!hasMultiplier) {
+		if (!corrobBlock || queryEntities.length === 0) {
+			note.textContent =
+				"Corroboração FAISS: não aplicada (nenhuma entidade nomeada encontrada).";
+			note.title = "";
+			return;
+		}
+		note.textContent =
+			"Corroboração FAISS indisponível (falha ao extrair texto do artigo).";
+		note.title = "";
+		return;
+	}
+	const multTxt = fmtRatio(multiplier);
+	const baseText = `Corroboração FAISS: ${multTxt} (bruto ${rawTxt} → ajustado ${adjTxt}).`;
+	const tooltipParts = [];
+	if (matchedEntities.length) {
+		tooltipParts.push(`Entidades encontradas: ${matchedEntities.join(", ")}`);
+	}
+	if (missingEntities.length) {
+		const miss = missingEntities.slice(0, 5).join(", ");
+		tooltipParts.push(`Ausentes: ${miss}`);
+	}
+	note.textContent = baseText;
+	note.title = tooltipParts.join(" | ");
 }
 
 function renderEntityVerification(block) {
@@ -459,16 +570,22 @@ function resetWikiCategoryChart() {
 function buildWikiCategoryStats(items) {
 	const stats = new Map();
 	items.forEach((item) => {
-		const categories = Array.isArray(item.categorias)
+		let categories = Array.isArray(item.categorias)
 			? item.categorias
 			: item.categoria
 			? [item.categoria]
 			: [];
-		const primary = categories.length > 0 ? categories[0] : "Sem categoria";
-		const current = stats.get(primary) || { count: 0, titles: [] };
-		current.count += 1;
-		current.titles.push(item.titulo || `Artigo ${item.id}`);
-		stats.set(primary, current);
+		if (!categories.length) {
+			categories = ["Sem categoria"];
+		}
+		categories.forEach((cat) => {
+			const current = stats.get(cat) || { count: 0, titles: [] };
+			current.count += 1;
+			if (current.titles.length < 5) {
+				current.titles.push(item.titulo || `Artigo ${item.id}`);
+			}
+			stats.set(cat, current);
+		});
 	});
 	return Array.from(stats.entries())
 		.map(([category, info]) => ({ category, ...info }))
@@ -481,10 +598,11 @@ function updateWikiCategoryChart(stats) {
 		resetWikiCategoryChart();
 		return;
 	}
-	const maxColors = sourceColors.length;
-	const topStats = stats.slice(0, maxColors);
-	const labels = topStats.map((s) => s.category);
-	const values = topStats.map((s) => s.count);
+	const labels = stats.map((s) => s.category);
+	const values = stats.map((s) => s.count);
+	const palette = labels.map(
+		(_, idx) => sourceColors[idx % sourceColors.length] || "#38bdf8"
+	);
 	if (!wikiCategoryChart) {
 		wikiCategoryChart = new Chart(ctx, {
 			type: "doughnut",
@@ -493,7 +611,7 @@ function updateWikiCategoryChart(stats) {
 				datasets: [
 					{
 						data: values,
-						backgroundColor: sourceColors,
+						backgroundColor: palette,
 					},
 				],
 			},
@@ -511,6 +629,7 @@ function updateWikiCategoryChart(stats) {
 	} else {
 		wikiCategoryChart.data.labels = labels;
 		wikiCategoryChart.data.datasets[0].data = values;
+		wikiCategoryChart.data.datasets[0].backgroundColor = palette;
 		wikiCategoryChart.update();
 	}
 }
@@ -555,6 +674,7 @@ function renderWikiSources(section) {
 		: [];
 	list.innerHTML = "";
 	hasWikiList = items.length > 0;
+
 	if (!hasWikiList) {
 		block.style.display = "none";
 		if (metaInfo) metaInfo.textContent = "";
@@ -569,9 +689,10 @@ function renderWikiSources(section) {
 		const shown = section?.limite_exibido ?? items.length;
 		const minScore = section?.limiar_similaridade ?? 0.7;
 		const configured = section?.limite_configurado ?? shown;
+		const relaxado = section?.relaxado_por_falta ? " (limiar relaxado)" : "";
 		metaInfo.textContent = `Exibindo ${shown} de ${total} (limite: ${configured} | ≥ ${Math.round(
 			minScore * 100
-		)}% de similaridade)`;
+		)}% de similaridade)${relaxado}`;
 	}
 	const stats = buildWikiCategoryStats(items);
 	updateWikiCategoryChart(stats);
@@ -642,6 +763,13 @@ document.addEventListener("DOMContentLoaded", () => {
 		}
 	};
 	el("closeRaw").onclick = () => toggleDetails(false);
+	const copyBtn = el("copyRaw");
+	if (copyBtn) {
+		copyBtn.disabled = true;
+		copyBtn.addEventListener("click", () => {
+			copyRawJson();
+		});
+	}
 
 	el("run").onclick = async () => {
 		const text = el("text").value ? el("text").value.trim() : "";
@@ -653,6 +781,10 @@ document.addEventListener("DOMContentLoaded", () => {
 		el("run").textContent = "Analisando...";
 		toggleDetails(false);
 		el("toggleRaw").disabled = true;
+		if (copyBtn) {
+			copyBtn.disabled = true;
+			copyBtn.textContent = "Copiar JSON";
+		}
 		const body = {
 			text,
 			k: Number(el("k")?.value || DEFAULT_PARAMS.k),
@@ -679,6 +811,7 @@ document.addEventListener("DOMContentLoaded", () => {
 			} else {
 				el("summaryArea").style.display = "block";
 				const h = json.historico?.consistencia;
+				const hRaw = json.historico?.consistencia_raw;
 				const b = json.bert?.prob_true;
 				const f = json.confirmacao_fontes?.fonte_score;
 				const fin = json.final?.score;
@@ -689,7 +822,14 @@ document.addEventListener("DOMContentLoaded", () => {
 				// Atualiza gráfico de pizza (apenas 3 fatias)
 				updatePieChart(h, b, f);
 				updateBarChart(h, b, f, fin);
-				el("out").textContent = JSON.stringify(json, null, 2);
+				renderCorroborationNote(
+					hRaw,
+					h,
+					json.historico?.corroboracao_multiplicador,
+					json.historico?.corroboracao
+				);
+				const displayPayload = json.frontend_view || json;
+				el("out").textContent = JSON.stringify(displayPayload, null, 2);
 				const fontes = json.confirmacao_fontes?.fontes_individuais || [];
 				const wikiSection = json.fontes_externas || {
 					artigos_wikipedia_similares: json.wikipedia?.matches || [],
@@ -703,6 +843,10 @@ document.addEventListener("DOMContentLoaded", () => {
 				);
 				renderWikiSources(wikiSection);
 				el("toggleRaw").disabled = false;
+				if (copyBtn) {
+					copyBtn.disabled = false;
+					copyBtn.textContent = "Copiar JSON";
+				}
 			}
 		} catch (e) {
 			alert(

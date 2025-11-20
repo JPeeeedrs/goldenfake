@@ -125,6 +125,7 @@
             <div class="pct" id="pctHist">--%</div>
             <div class="bar"><span id="barHist"></span></div>
             <div class="status" id="stHist"></div>
+            <div class="metric__note" id="histCorrNote"></div>
           </div>
           <div class="metric" id="mBert">
             <div class="metric__meta">
@@ -243,7 +244,10 @@
           <h2>Payload bruto</h2>
           <p>JSON completo retornado pela API</p>
         </div>
-        <button id="closeRaw" class="danger">Fechar</button>
+        <div class="details-actions">
+          <button id="copyRaw" class="ghost" disabled>Copiar JSON</button>
+          <button id="closeRaw" class="danger">Fechar</button>
+        </div>
       </div>
       <pre id="out">{}</pre>
     </section>
