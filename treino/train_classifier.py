@@ -4,13 +4,13 @@ import joblib
 import numpy as np
 import re
 import argparse
-from typing import List, Tuple, Iterable, Optional
+from typing import List, Tuple, Iterable
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sentence_transformers import SentenceTransformer
+from xgboost import XGBClassifier
 
 # Tentar carregar spaCy e um modelo PT; fallback para regex se indisponível
 try:
@@ -300,6 +300,15 @@ def main():
     if not texts:
         print("Nenhum dado válido no dataset.")
         return
+    
+    # --- MODO TESTE RÁPIDO (Apague isso amanhã!) ---
+    print("⚠️ MODO TESTE ATIVADO: Usando 25 Fakes e 25 Trues!")
+    
+    # Pegamos as 25 primeiras (que sabemos que são Fake)
+    # E as 25 últimas (que sabemos que são True, pois estão no fim da lista)
+    texts = texts[:25] + texts[-25:]
+    labels = labels[:25] + labels[-25:]
+    # -----------------------------------------------
 
     print(f"Amostras totais: {len(texts)}")
 
@@ -366,22 +375,30 @@ def main():
         style_scaler = None
         X_train = X_train_sbert
 
-    print("Treinando classificador (LogisticRegression)...")
-    # Evitar dupla ponderação: se usamos sample_weight (debias weight/both), não usar class_weight
-    use_sample_w = args.debias in ("weight", "both")
-    cls_weight = None if use_sample_w else "balanced"
-    base_clf = LogisticRegression(
-        max_iter=2000, class_weight=cls_weight, C=0.1, solver="lbfgs")
+    print("Treinando classificador XGBoost...")
 
-    if args.calibrate:
-        clf = CalibratedClassifierCV(
-            estimator=base_clf, method="isotonic", cv=5)
-    else:
-        clf = base_clf
+    use_sample_w = args.debias in ("weight", "both")
+
+    base_clf = XGBClassifier(
+        n_estimators=200,
+        max_depth=6,
+        learning_rate=0.1,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        random_state=42,
+        n_jobs=-1 # usar todos os núcleos disponíveis
+    )
+
+    print("Aplicando Calibração Isotônica (para porcentagens precisas)...")
+
+    clf = CalibratedClassifierCV(
+        estimator=base_clf,
+        method="isotonic",
+        cv=5
+    )
 
     try:
-        clf.fit(X_train, y_train_for_fit, sample_weight=(
-            sample_weight if use_sample_w else None))
+        clf.fit(X_train,y_train_for_fit, sample_weight=(sample_weight if use_sample_w else None))
     except TypeError:
         clf.fit(X_train, y_train_for_fit)
 

@@ -10,7 +10,7 @@
   ],
   "protected_terms_file": "debias_config.json",
   "spacy": true,
-  "style_features": true,
+  "style_features": false,
   "style_feature_count": 8,
   "style_scale": 0.2,
   "calibrated": false,
