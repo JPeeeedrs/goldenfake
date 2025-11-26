@@ -301,14 +301,7 @@ def main():
         print("Nenhum dado válido no dataset.")
         return
     
-    # --- MODO TESTE RÁPIDO (Apague isso amanhã!) ---
-    print("⚠️ MODO TESTE ATIVADO: Usando 25 Fakes e 25 Trues!")
     
-    # Pegamos as 25 primeiras (que sabemos que são Fake)
-    # E as 25 últimas (que sabemos que são True, pois estão no fim da lista)
-    texts = texts[:25] + texts[-25:]
-    labels = labels[:25] + labels[-25:]
-    # -----------------------------------------------
 
     print(f"Amostras totais: {len(texts)}")
 
