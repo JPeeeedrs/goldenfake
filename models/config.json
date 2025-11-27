@@ -1,18 +1,14 @@
 {
   "embed_model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
   "normalize": true,
-  "debias": "both",
-  "protected_mode": "auto",
-  "entity_types": [
-    "PERSON",
-    "ORG",
-    "GPE"
-  ],
-  "protected_terms_file": "debias_config.json",
-  "spacy": true,
+  "debias": "mask",
   "style_features": false,
   "style_feature_count": 8,
-  "style_scale": 0.2,
-  "calibrated": false,
-  "max_seq_length": 512
+  "style_weight": 0.15,
+  "max_seq_length": 512,
+  "n_estimators": 300,
+  "max_depth": 7,
+  "learning_rate": 0.05,
+  "calibrated": true,
+  "calibration_method": "isotonic"
 }

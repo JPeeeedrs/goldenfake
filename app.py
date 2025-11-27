@@ -2,8 +2,12 @@ from flask import Flask, send_from_directory, request, jsonify
 import os
 import numpy as np
 import requests
+import logging
 
-# Reuso do pipeline existente
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Imports do pipeline otimizado
 from fact_checker import (
     load_vector_store,
     load_classifier,
@@ -11,14 +15,22 @@ from fact_checker import (
     bert_probability_true_for_text,
     fuse_scores,
     classify_text,
-    load_online_adaptor,
-    combined_historical_consistency_for_text,
     blend_score_with_entities,
     faiss_claim_corroboration,
     ENTITY_BERT_WEIGHT,
 )
-from external_sources import verify_with_external_sources
 
+# External sources (mantido separado por ser grande)
+try:
+    from external_sources import verify_with_external_sources
+    HAS_EXTERNAL = True
+except ImportError:
+    logger.warning("external_sources.py não disponível. Fontes externas desabilitadas.")
+    HAS_EXTERNAL = False
+    def verify_with_external_sources(text, sbert):
+        return 50.0, [], {}
+
+# Configurações Wikipedia
 WIKI_API_URL = "https://pt.wikipedia.org/w/api.php"
 WIKI_NEIGHBOR_LIMIT = 5
 WIKI_ABS_MAX_RESULTS = 50
@@ -26,39 +38,21 @@ WIKI_SIMILARITY_THRESHOLD = 0.7
 WIKI_REQUEST_HEADERS = {
     "User-Agent": "GoldenFake/1.0 (+https://github.com/JPeeeedrs/goldenfake)"
 }
+
+# Categorias para filtrar
 WIKI_CATEGORY_EXCLUDE_PREFIXES = (
-    "artigo",
-    "artigos",
-    "página",
-    "páginas",
-    "pagina",
-    "paginas",
-    "lista",
-    "listas",
-    "wikipédia",
-    "wikipedia",
-    "wikiprojeto",
-    "cs1",
-    "!",
-    "todos os artigos",
-    "predefinições",
-    "predefinicoes",
+    "artigo", "artigos", "página", "páginas", "lista", "listas",
+    "wikipédia", "wikipedia", "wikiprojeto", "cs1", "!",
+    "todos os artigos", "predefinições", "predefinicoes",
 )
+
 WIKI_CATEGORY_EXCLUDE_SUBSTRINGS = (
-    "wikificação",
-    "wikificacao",
-    "manutenção",
-    "manutencao",
-    "fontes",
-    "cs1",
-    "stub",
-    "esboço",
-    "esboco",
-    "ajuda",
-    "artigo destacado",
-    "artigos destacados",
+    "wikificação", "wikificacao", "manutenção", "manutencao",
+    "fontes", "cs1", "stub", "esboço", "esboco", "ajuda",
+    "artigo destacado", "artigos destacados",
 )
-_WIKI_INFO_CACHE: dict[str, dict] = {}
+
+_WIKI_INFO_CACHE = {}
 
 app = Flask(__name__, static_folder='static')
 
@@ -66,31 +60,33 @@ app = Flask(__name__, static_folder='static')
 def serve_index():
     return send_from_directory('.', 'index.html')
 
-# Habilitar CORS para desenvolvimento (inclui file:// como origem nula)
+# CORS
 try:
     from flask_cors import CORS
-    CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=False, methods=[
-         "GET", "POST", "OPTIONS"], allow_headers=["Content-Type"], expose_headers=["Content-Type"], send_wildcard=True)
-except Exception:
-    pass
+    CORS(app, resources={r"/*": {"origins": "*"}})
+except ImportError:
+    logger.warning("flask-cors não instalado. CORS pode não funcionar.")
 
-# Carregar artefatos uma vez
-INDEX, METADATA, VCFG = load_vector_store()
-CLF, LE, SBERT, CCFG = load_classifier()
-ONLINE = load_online_adaptor(LE, SBERT, CCFG)
+# Carregar modelos na inicialização
+try:
+    INDEX, METADATA, VCFG = load_vector_store()
+    CLF, LE, SBERT, CCFG = load_classifier()
+    logger.info("Modelos carregados com sucesso")
+except Exception as e:
+    logger.error(f"Erro ao carregar modelos: {e}")
+    raise
 
+# Defaults
 DEFAULTS = {
     "k": 20,
     "w_hist": 0.4,
     "w_bert": 0.3,
     "w_fontes": 0.3,
     "entity_bert_weight": ENTITY_BERT_WEIGHT,
-    # novos padrões de chunking
     "max_tokens": 512,
     "overlap_tokens": 128,
-    "hist_agg": "max",   # max ou mean
-    "bert_agg": "mean",  # mean ou max
-    # parâmetros de recuperação híbrida FAISS + Wikipedia
+    "hist_agg": "max",
+    "bert_agg": "mean",
     "use_wiki": False,
     "wiki_titles": 3,
     "w_faiss": 0.5,
@@ -98,73 +94,59 @@ DEFAULTS = {
 }
 
 
-def _negative_label_from_le(le) -> str:
-    classes = list(getattr(le, "classes_", []))
-    if not classes:
-        return "false"
-    if "true" in classes and len(classes) == 2:
-        return classes[0] if classes[1] == "true" else classes[1]
-    # fallback: use first non-true
-    for c in classes:
-        if c != "true":
-            return c
-    return classes[0]
-
-
 def _as_bool(val, default=False):
+    """Converte valor para boolean."""
     if isinstance(val, bool):
         return val
     s = str(val).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    return s in ("1", "true", "yes", "y", "on")
 
 
 def _flatten_external_evidence(details):
+    """Achata lista de evidências externas para o frontend."""
     items = []
     seen = set()
+    
     for cl in details or []:
         for ev in (cl.get("evidencias") or []):
             url = ev.get("url") or ""
             key = url or f"{ev.get('title') or ''}|{ev.get('publisher') or ''}"
+            
             if key in seen:
                 continue
             seen.add(key)
-            sc = ev.get("score")
-            tags = ev.get("source_tags") or []
-            rating_text = str(ev.get("rating") or "").strip().lower()
-            is_false_fact_check = False
-            if rating_text:
-                for token in ("falso", "false", "fake", "enganoso", "mentira", "boato", "hoax", "incorrect", "incorreto", "impreciso"):
-                    if token in rating_text:
-                        is_false_fact_check = True
-                        break
+            
+            # Extrair porcentagem
             sim = ev.get("similaridade")
+            sc = ev.get("score")
+            
             try:
                 pct = round(float(sim) * 100.0, 1) if sim is not None else None
             except Exception:
                 pct = None
+            
             if pct is None and sc is not None:
                 try:
                     pct = round(float(sc) * 100.0, 1)
                 except Exception:
                     pct = None
+            
             if pct is None:
                 pct = 0.0
+            
+            # Análise de rating
             rating = ev.get("rating")
-            fc_flag = bool(ev.get("fact_checker")) or (
-                isinstance(rating, str) and "fact-check" in rating.lower())
+            rating_text = str(rating or "").strip().lower()
+            
             verdict = None
             if isinstance(rating, str):
-                lower_rating = rating.lower()
-                if any(tok in lower_rating for tok in ("false", "falso", "fake", "enganoso", "mentira", "boato", "hoax")):
+                if any(tok in rating_text for tok in ("false", "falso", "fake", "enganoso")):
                     verdict = "false"
                     pct = 0.0
-                elif any(tok in lower_rating for tok in ("true", "verdadeiro", "verídico", "correct", "correto", "confirmed", "confirmado")):
+                elif any(tok in rating_text for tok in ("true", "verdadeiro", "correct", "correto")):
                     verdict = "true"
                     pct = 100.0
+            
             items.append({
                 "title": ev.get("title"),
                 "url": url,
@@ -173,32 +155,20 @@ def _flatten_external_evidence(details):
                 "percent": pct,
                 "similaridade": sim,
                 "confianca_fonte": ev.get("confianca_fonte"),
-                "overlap_bucket": ev.get("overlap_bucket") or (
-                    ">=50%" if ev.get("passes_50pct") else (
-                        "40-49%" if ev.get("passes_40pct") else "<40%")
-                ),
+                "overlap_bucket": ev.get("overlap_bucket") or "N/A",
                 "is_social": ev.get("is_social", False),
-                "fact_checker": fc_flag,
+                "fact_checker": bool(ev.get("fact_checker")),
                 "rating": rating,
-                # include backend-generated source tags for UI badges
-                "source_tags": tags,
-                "fact_check_invalida": is_false_fact_check,
-                "fact_check_veredito": verdict,
-                "gemini_confidence": ev.get("gemini_confidence"),
-                "gemini_evidence_used": ev.get("gemini_evidence_used"),
-                "gemini_veredito": ev.get("gemini_verdict") or verdict,
+                "source_tags": ev.get("source_tags") or [],
                 "gemini_percent_true": ev.get("percent_true"),
             })
+    
     items.sort(key=lambda x: x.get("percent") or 0, reverse=True)
     return items
 
 
-def _batched(seq, size):
-    for i in range(0, len(seq), size):
-        yield seq[i:i + size]
-
-
-def _normalize_category_title(title: str | None) -> str | None:
+def _normalize_category_title(title):
+    """Remove prefixo 'Categoria:' se presente."""
     if not title:
         return None
     if title.startswith("Categoria:"):
@@ -206,36 +176,50 @@ def _normalize_category_title(title: str | None) -> str | None:
     return title
 
 
-def _clean_wiki_categories(categories: list[str]) -> list[str]:
-    cleaned: list[str] = []
+def _clean_wiki_categories(categories):
+    """Filtra categorias irrelevantes da Wikipedia."""
+    cleaned = []
+    
     for cat in categories or []:
         if not cat:
             continue
+        
         norm = cat.strip()
         if not norm:
             continue
+        
         lower = norm.lower()
         skip = False
+        
+        # Verificar prefixos
         for prefix in WIKI_CATEGORY_EXCLUDE_PREFIXES:
             if lower.startswith(prefix):
                 skip = True
                 break
+        
+        # Verificar substrings
         if not skip:
             for token in WIKI_CATEGORY_EXCLUDE_SUBSTRINGS:
                 if token in lower:
                     skip = True
                     break
+        
         if skip:
             continue
+        
         cleaned.append(norm)
         if len(cleaned) >= 6:
             break
+    
+    # Se não sobrou nada, retornar primeiras 3 originais
     if not cleaned:
         return (categories or [])[:3]
+    
     return cleaned
 
 
-def _clamp_wiki_limit(k: int | None, wiki_titles: int | None) -> int:
+def _clamp_wiki_limit(k, wiki_titles):
+    """Limita número de artigos Wikipedia."""
     candidates = [wiki_titles, k, WIKI_NEIGHBOR_LIMIT]
     for cand in candidates:
         if isinstance(cand, (int, float)) and cand and cand > 0:
@@ -244,12 +228,18 @@ def _clamp_wiki_limit(k: int | None, wiki_titles: int | None) -> int:
     return WIKI_NEIGHBOR_LIMIT
 
 
-def _fetch_wikipedia_metadata(page_ids: list[str]) -> dict[str, dict]:
+def _fetch_wikipedia_metadata(page_ids):
+    """Busca metadados de páginas Wikipedia."""
     page_ids = [str(pid) for pid in page_ids if pid]
     if not page_ids:
         return {}
+    
     missing = [pid for pid in page_ids if pid not in _WIKI_INFO_CACHE]
-    for chunk in _batched(missing, 20):
+    
+    # Processar em lotes de 20
+    for i in range(0, len(missing), 20):
+        chunk = missing[i:i+20]
+        
         params = {
             "action": "query",
             "format": "json",
@@ -258,6 +248,7 @@ def _fetch_wikipedia_metadata(page_ids: list[str]) -> dict[str, dict]:
             "cllimit": 20,
             "pageids": "|".join(chunk),
         }
+        
         try:
             resp = requests.get(
                 WIKI_API_URL,
@@ -266,75 +257,96 @@ def _fetch_wikipedia_metadata(page_ids: list[str]) -> dict[str, dict]:
                 headers=WIKI_REQUEST_HEADERS,
             )
             resp.raise_for_status()
-            pages = (resp.json().get("query", {}) or {}).get("pages", {}) or {}
+            
+            pages = resp.json().get("query", {}).get("pages", {}) or {}
+            
             for pid, data in pages.items():
                 cats = []
                 for cat in data.get("categories") or []:
                     norm = _normalize_category_title(cat.get("title"))
                     if norm:
                         cats.append(norm)
+                
                 cats = _clean_wiki_categories(cats)
+                
                 _WIKI_INFO_CACHE[pid] = {
                     "title": data.get("title"),
                     "displaytitle": data.get("displaytitle"),
                     "fullurl": data.get("fullurl"),
                     "categories": cats,
                 }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Erro ao buscar metadata Wikipedia: {e}")
             for pid in chunk:
                 _WIKI_INFO_CACHE.setdefault(pid, {})
+    
     return {pid: _WIKI_INFO_CACHE.get(pid, {}).copy() for pid in page_ids}
 
 
 def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
-                        similarity_threshold=WIKI_SIMILARITY_THRESHOLD):
+                       similarity_threshold=WIKI_SIMILARITY_THRESHOLD):
+    """Constrói seção de fontes Wikipedia."""
     section = {
         "artigos_wikipedia_similares": [],
-    "categorias_expandido": {},
+        "categorias_expandido": {},
         "total_encontrado": 0,
         "limite_exibido": 0,
         "limite_configurado": limit,
         "limiar_similaridade": similarity_threshold,
         "relaxado_por_falta": False,
     }
+    
     if not neighbors or not metadata:
         return section
-
-    best_by_article: dict[str, float] = {}
+    
+    # Agrupar por artigo (pegar melhor similaridade)
+    best_by_article = {}
+    
     for idx, sim in neighbors:
-        if idx is None or idx < 0:
+        if idx is None or idx < 0 or idx >= len(metadata):
             continue
-        if idx >= len(metadata):
-            continue
+        
         meta = metadata[idx] or {}
         article_id = str(meta.get("id")) if meta.get("id") is not None else None
+        
         if not article_id:
             continue
+        
         sim_val = float(sim or 0.0)
         current = best_by_article.get(article_id)
+        
         if current is None or sim_val > current:
             best_by_article[article_id] = sim_val
-
+    
     if not best_by_article:
         return section
-
+    
+    # Ordenar por similaridade
     sorted_articles = sorted(best_by_article.items(), key=lambda x: x[1], reverse=True)
+    
+    # Filtrar por threshold
     filtered = [(aid, score) for aid, score in sorted_articles if score >= similarity_threshold]
+    
     if not filtered:
-        # relaxar limiar se nada atingir o threshold, mas registrar para o frontend
+        # Relaxar threshold se nada passou
         filtered = sorted_articles[:limit]
         section["relaxado_por_falta"] = True
+    
     section["total_encontrado"] = len(filtered)
     top = filtered[:limit]
     section["limite_exibido"] = len(top)
+    
     if not top:
         return section
-
+    
+    # Buscar metadados
     meta_map = _fetch_wikipedia_metadata([aid for aid, _ in top])
+    
     articles = []
     for aid, score in top:
         info = meta_map.get(aid) or {}
         cats = info.get("categories") or []
+        
         articles.append({
             "id": aid,
             "titulo": info.get("displaytitle") or info.get("title") or f"Artigo {aid}",
@@ -343,23 +355,31 @@ def _build_wiki_sources(neighbors, metadata, limit=WIKI_NEIGHBOR_LIMIT,
             "categorias": cats,
             "url": info.get("fullurl") or f"https://pt.wikipedia.org/?curid={aid}",
         })
+    
     section["artigos_wikipedia_similares"] = articles
-    cat_map: dict[str, list[dict]] = {}
+    
+    # Agrupar por categoria
+    cat_map = {}
     for art in articles:
         cats = art.get("categorias") or []
         if not cats:
             cat_map.setdefault("Sem categoria", []).append(art)
             continue
+        
         for cat in cats:
             cat_map.setdefault(cat, []).append(art)
-    # ordenar artigos em cada categoria por similaridade
+    
+    # Ordenar artigos em cada categoria
     for cat, items in cat_map.items():
         items.sort(key=lambda x: x.get("similaridade", 0), reverse=True)
+    
     section["categorias_expandido"] = cat_map
+    
     return section
 
 
-def _build_frontend_view(payload: dict) -> dict:
+def _build_frontend_view(payload):
+    """Constrói visão simplificada para o frontend."""
     confirm = payload.get("confirmacao_fontes") or {}
     fontes_individuais = confirm.get("fontes_individuais") or []
     entidades_block = confirm.get("entidades_verificadas") or {}
@@ -367,7 +387,8 @@ def _build_frontend_view(payload: dict) -> dict:
     historico = payload.get("historico") or {}
     bert_block = payload.get("bert") or {}
     final_block = payload.get("final") or {}
-
+    
+    # Evidências principais
     evidencias_principais = []
     for item in fontes_individuais[:8]:
         evidencias_principais.append({
@@ -378,7 +399,8 @@ def _build_frontend_view(payload: dict) -> dict:
             "percent": item.get("percent"),
             "tags": item.get("source_tags"),
         })
-
+    
+    # Entidades
     entidades_lista = []
     for ent in entidades_block.get("entidades") or []:
         entidades_lista.append({
@@ -388,19 +410,7 @@ def _build_frontend_view(payload: dict) -> dict:
             "score": ent.get("score"),
             "provider": ent.get("provider"),
         })
-
-    nivelamento = []
-    for det in confirm.get("detalhes") or []:
-        gem = det.get("gemini_investigativo") or {}
-        nivelamento.append({
-            "afirmacao": det.get("afirmacao"),
-            "nivel": det.get("nivel"),
-            "score_afirmacao": det.get("score_afirmacao"),
-            "nivel1_total": det.get("nivel1_total"),
-            "nivel2_total": det.get("nivel2_total"),
-            "gemini_percent_true": gem.get("percent_true"),
-        })
-
+    
     return {
         "texto_analisado": payload.get("texto_analisado"),
         "score_final": final_block.get("score"),
@@ -419,7 +429,6 @@ def _build_frontend_view(payload: dict) -> dict:
             "fontes": {
                 "fonte_score": confirm.get("fonte_score"),
                 "total_fontes": len(fontes_individuais),
-                "nivelamento": nivelamento,
             },
         },
         "fontes": {
@@ -447,95 +456,88 @@ def _build_frontend_view(payload: dict) -> dict:
     }
 
 
-def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_fontes: float,
-                         entity_bert_weight: float,
-                         max_tokens: int, overlap_tokens: int, hist_agg: str, bert_agg: str,
-                         use_wiki: bool, wiki_titles: int, w_faiss: float, w_wiki: float):
+def analyze_text_payload(text, k, w_hist, w_bert, w_fontes,
+                        entity_bert_weight, max_tokens, overlap_tokens,
+                        hist_agg, bert_agg, use_wiki, wiki_titles,
+                        w_faiss, w_wiki):
+    """Função principal de análise."""
     text = (text or "").strip()
     if not text:
         return {"error": "texto vazio"}, 400
+    
     wiki_limit = _clamp_wiki_limit(k, wiki_titles)
-
-    # Consistência histórica (FAISS) ou combinação com Wikipedia
-    hist_info = {}
-    if use_wiki:
-        hist_score, hist_info = combined_historical_consistency_for_text(
-            INDEX, SBERT, text,
-            k=k,
-            max_tokens=max_tokens,
-            overlap_tokens=overlap_tokens,
-            aggregate=hist_agg,
-            wiki_titles=wiki_limit,
-            w_faiss=w_faiss,
-            w_wiki=w_wiki,
-        )
-        neighbors = hist_info.get("faiss", {}).get("vizinhos") or []
-    else:
-        hist_score, neighbors = historical_consistency_for_text(
-            INDEX, SBERT, text, k=k, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=hist_agg
-        )
-
+    
+    # Consistência histórica (FAISS)
+    hist_score, neighbors = historical_consistency_for_text(
+        INDEX, SBERT, text,
+        k=k,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        aggregate=hist_agg
+    )
+    
+    # Corroboração FAISS
     faiss_corroboration = faiss_claim_corroboration(neighbors, METADATA, text)
     hist_score_raw = hist_score
     corroboration_multiplier = None
+    
     if faiss_corroboration:
         corroboration_multiplier = faiss_corroboration.get("corroboration_score")
         if corroboration_multiplier is not None:
             try:
                 multiplier = float(corroboration_multiplier)
-            except (TypeError, ValueError):
-                multiplier = None
-            if multiplier is not None:
                 multiplier = max(0.0, min(1.0, multiplier))
                 hist_score = hist_score * multiplier
                 corroboration_multiplier = multiplier
-
+            except (TypeError, ValueError):
+                pass
+    
+    # BERT
     bert_score_true_raw = bert_probability_true_for_text(
-        CLF, LE, SBERT, CCFG, text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg
+        CLF, LE, SBERT, CCFG, text,
+        max_tokens=max_tokens,
+        overlap_tokens=overlap_tokens,
+        aggregate=bert_agg
     )
+    
     bert_score_true = bert_score_true_raw
     bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
-
+    
+    # Fontes externas
     fonte_score, fonte_details, entity_block = verify_with_external_sources(text, SBERT)
+    
     entity_avg = None
     if entity_block:
         bert_score_true, entity_avg = blend_score_with_entities(
-            bert_score_true_raw, entity_block, entity_bert_weight)
+            bert_score_true_raw, entity_block, entity_bert_weight
+        )
         bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
+    
     fontes_individuais = _flatten_external_evidence(fonte_details)
-
-    # Adaptador online (se já houver updates)
-    online_prob = ONLINE.prob_true_for_text(
-        text, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg)
-    alpha_online = ONLINE.alpha() if ONLINE.is_trained() else 0.0
-
-    # Primeiro, média ponderada entre histórico, bert e fontes (reduzindo peso de BERT pelo (1-alpha))
-    base_final = fuse_scores(hist_score, bert_score_true,
-                             fonte_score, w_hist, w_bert * (1 - alpha_online), w_fontes)
-    # Em seguida, mesclar com o adaptador online conforme alpha
+    
+    # Score final
     final_score = fuse_scores(
-        base_final, (online_prob if online_prob is not None else 0.0), None, 1 - alpha_online, alpha_online, 0.0)
+        hist_score, bert_score_true, fonte_score,
+        w_hist, w_bert, w_fontes
+    )
+    
     final_label, _ = classify_text(final_score)
-
+    
+    # Montar payload
     historico_block = {
         "consistencia": round(hist_score, 1),
         "consistencia_raw": round(hist_score_raw, 1),
         "k": k,
         "aggregate": hist_agg,
+        "vizinhos": neighbors,
     }
-    if use_wiki:
-        historico_block.update({
-            "faiss": hist_info.get("faiss"),
-            "wikipedia": hist_info.get("wikipedia"),
-            "pesos_hist": hist_info.get("pesos"),
-        })
-    else:
-        historico_block["vizinhos"] = neighbors
+    
     if faiss_corroboration:
         historico_block["corroboracao"] = faiss_corroboration
+    
     if corroboration_multiplier is not None:
         historico_block["corroboracao_multiplicador"] = round(float(corroboration_multiplier), 4)
-
+    
     payload = {
         "texto_analisado": text,
         "historico": historico_block,
@@ -553,11 +555,6 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             "fontes_individuais": fontes_individuais,
             "entidades_verificadas": entity_block,
         },
-        "online_adaptor": {
-            "prob_true": (round(online_prob, 1) if online_prob is not None else None),
-            "alpha": round(alpha_online, 2),
-            "n_updates": getattr(ONLINE, "n_updates", 0),
-        },
         "final": {
             "rotulo": final_label,
             "score": round(final_score, 1),
@@ -573,63 +570,61 @@ def analyze_text_payload(text: str, k: int, w_hist: float, w_bert: float, w_font
             "overlap_tokens": overlap_tokens,
         },
     }
-    if faiss_corroboration:
-        payload["faiss_corroboracao"] = faiss_corroboration
+    
+    # Wikipedia sources
     wiki_section = _build_wiki_sources(neighbors, METADATA, limit=wiki_limit)
     payload["fontes_externas"] = wiki_section
     payload["wikipedia"] = {
         "matches": wiki_section.get("artigos_wikipedia_similares", []),
-        "score": (hist_info.get("wikipedia", {}).get("score") if use_wiki else None),
         "titles_limit": wiki_limit,
     }
+    
+    # Frontend view
     payload["frontend_view"] = _build_frontend_view(payload)
+    
     return payload, 200
 
 
 @app.route("/health", methods=["GET"])
 def health():
+    """Health check endpoint."""
     return jsonify({"status": "ok"})
 
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
-    data = {}
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-    else:
-        # fallback para form-urlencoded
-        data = request.form.to_dict()
-
+    """Endpoint principal de análise."""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    
     text = data.get("text") or data.get("texto") or ""
-
+    
     def _get_num(key, typ, default):
         try:
             return typ(data.get(key, default))
         except Exception:
             return default
-
+    
     k = _get_num("k", int, DEFAULTS["k"])
     w_hist = _get_num("w_hist", float, DEFAULTS["w_hist"])
     w_bert = _get_num("w_bert", float, DEFAULTS["w_bert"])
     w_fontes = _get_num("w_fontes", float, DEFAULTS["w_fontes"])
     entity_weight = _get_num("entity_bert_weight", float, DEFAULTS["entity_bert_weight"])
-
     max_tokens = _get_num("max_tokens", int, DEFAULTS["max_tokens"])
-    overlap_tokens = _get_num("overlap_tokens", int,
-                              DEFAULTS["overlap_tokens"])
-
+    overlap_tokens = _get_num("overlap_tokens", int, DEFAULTS["overlap_tokens"])
+    
     hist_agg = str(data.get("hist_agg", DEFAULTS["hist_agg"]))
     if hist_agg not in ("max", "mean"):
         hist_agg = DEFAULTS["hist_agg"]
+    
     bert_agg = str(data.get("bert_agg", DEFAULTS["bert_agg"]))
     if bert_agg not in ("max", "mean"):
         bert_agg = DEFAULTS["bert_agg"]
-
+    
     use_wiki = _as_bool(data.get("use_wiki", DEFAULTS["use_wiki"]))
     wiki_titles = _get_num("wiki_titles", int, DEFAULTS["wiki_titles"])
     w_faiss = _get_num("w_faiss", float, DEFAULTS["w_faiss"])
     w_wiki = _get_num("w_wiki", float, DEFAULTS["w_wiki"])
-
+    
     result, status = analyze_text_payload(
         text=text,
         k=k,
@@ -646,58 +641,41 @@ def analyze():
         w_faiss=w_faiss,
         w_wiki=w_wiki,
     )
+    
     return jsonify(result), status
 
 
 @app.route("/analyze_friendly", methods=["POST"])
 def analyze_friendly():
-    data = {}
-    if request.is_json:
-        data = request.get_json(silent=True) or {}
-    else:
-        data = request.form.to_dict()
-
+    """Endpoint com resposta simplificada."""
+    data = request.get_json(silent=True) or request.form.to_dict() or {}
+    
     text = data.get("text") or data.get("texto") or ""
-
+    
     if not text.strip():
         return jsonify({"error": "Por favor, insira um texto para análise."}), 400
-
-    k = int(data.get("k", DEFAULTS["k"]))
-    w_hist = float(data.get("w_hist", DEFAULTS["w_hist"]))
-    w_bert = float(data.get("w_bert", DEFAULTS["w_bert"]))
-    w_fontes = float(data.get("w_fontes", DEFAULTS["w_fontes"]))
-    entity_weight = float(data.get("entity_bert_weight", DEFAULTS["entity_bert_weight"]))
-    max_tokens = int(data.get("max_tokens", DEFAULTS["max_tokens"]))
-    overlap_tokens = int(
-        data.get("overlap_tokens", DEFAULTS["overlap_tokens"]))
-    hist_agg = data.get("hist_agg", DEFAULTS["hist_agg"]).lower()
-    bert_agg = data.get("bert_agg", DEFAULTS["bert_agg"]).lower()
-
-    use_wiki = _as_bool(data.get("use_wiki", DEFAULTS["use_wiki"]))
-    wiki_titles = int(data.get("wiki_titles", DEFAULTS["wiki_titles"]))
-    w_faiss = float(data.get("w_faiss", DEFAULTS["w_faiss"]))
-    w_wiki = float(data.get("w_wiki", DEFAULTS["w_wiki"]))
-
+    
+    # Usar defaults
     result, status = analyze_text_payload(
         text=text,
-        k=k,
-        w_hist=w_hist,
-        w_bert=w_bert,
-        w_fontes=w_fontes,
-        entity_bert_weight=entity_weight,
-        max_tokens=max_tokens,
-        overlap_tokens=overlap_tokens,
-        hist_agg=hist_agg,
-        bert_agg=bert_agg,
-        use_wiki=use_wiki,
-        wiki_titles=wiki_titles,
-        w_faiss=w_faiss,
-        w_wiki=w_wiki,
+        k=int(data.get("k", DEFAULTS["k"])),
+        w_hist=float(data.get("w_hist", DEFAULTS["w_hist"])),
+        w_bert=float(data.get("w_bert", DEFAULTS["w_bert"])),
+        w_fontes=float(data.get("w_fontes", DEFAULTS["w_fontes"])),
+        entity_bert_weight=float(data.get("entity_bert_weight", DEFAULTS["entity_bert_weight"])),
+        max_tokens=int(data.get("max_tokens", DEFAULTS["max_tokens"])),
+        overlap_tokens=int(data.get("overlap_tokens", DEFAULTS["overlap_tokens"])),
+        hist_agg=data.get("hist_agg", DEFAULTS["hist_agg"]),
+        bert_agg=data.get("bert_agg", DEFAULTS["bert_agg"]),
+        use_wiki=_as_bool(data.get("use_wiki", DEFAULTS["use_wiki"])),
+        wiki_titles=int(data.get("wiki_titles", DEFAULTS["wiki_titles"])),
+        w_faiss=float(data.get("w_faiss", DEFAULTS["w_faiss"])),
+        w_wiki=float(data.get("w_wiki", DEFAULTS["w_wiki"])),
     )
-
+    
     if status != 200:
         return jsonify(result), status
-
+    
     friendly_output = {
         "Texto Analisado": result["texto_analisado"],
         "Consistência Histórica": f"{result['historico']['consistencia']}%",
@@ -706,121 +684,13 @@ def analyze_friendly():
             "Probabilidade de Verdadeiro": f"{result['bert']['prob_true']}%",
         },
         "Confirmação por Fontes Externas": f"{result['confirmacao_fontes']['fonte_score']}%",
-        "Adaptador Online": {
-            "Prob Verdadeiro": (f"{result['online_adaptor']['prob_true']}%" if result['online_adaptor']['prob_true'] is not None else None),
-            "Alpha": result['online_adaptor']['alpha'],
-            "Atualizações": result['online_adaptor']['n_updates'],
-        },
         "Classificação Final": {
             "Rótulo": result["final"]["rotulo"],
             "Score": f"{result['final']['score']}%",
         },
     }
-
+    
     return jsonify(friendly_output), 200
-
-
-@app.route("/train_online", methods=["POST"])
-def train_online():
-    """
-    Atualiza o adaptador online com textos enviados pelo front.
-    Request JSON/body:
-    {
-      text: string | undefined,
-      texts: [string] | undefined,
-      label: "true"|"false"|"fake" | undefined,
-      labels: [..] | undefined,
-      auto_label: bool (default true, usa BERT atual),
-      threshold: number (0-1 ou 0-100; default 0.7),
-      max_tokens, overlap_tokens, bert_agg (opcionais para auto_label)
-    }
-    """
-    data = request.get_json(
-        silent=True) or request.form.to_dict(flat=True) or {}
-
-    # Coletar textos
-    texts = []
-    if isinstance(data.get("texts"), list):
-        texts = [str(t) for t in data.get("texts")]
-    elif data.get("texts") and isinstance(data.get("texts"), str):
-        # permitir CSV simples
-        texts = [s for s in data.get("texts").split("\n") if s.strip()]
-    if data.get("text"):
-        texts.append(str(data.get("text")))
-    # limpar
-    texts = [t.strip() for t in texts if isinstance(t, str) and t.strip()]
-
-    if not texts:
-        return jsonify({"updated": 0, "error": "nenhum texto fornecido"}), 400
-
-    # Labels (opcionais)
-    labels_in = None
-    if isinstance(data.get("labels"), list):
-        labels_in = [str(x).lower().strip() for x in data.get("labels")]
-    elif data.get("label"):
-        labels_in = [str(data.get("label")).lower().strip()] * len(texts)
-
-    auto_label = True if str(data.get("auto_label", "true")).lower() in (
-        "1", "true", "yes", "y") else False
-    # Interpretar threshold em 0-1 ou 0-100
-    thr_raw = data.get("threshold", 0.7)
-    try:
-        thr = float(thr_raw)
-    except Exception:
-        thr = 0.7
-    if (thr > 1.0):
-        thr = thr / 100.0
-    thr = float(np.clip(thr, 0.5, 0.99))
-
-    max_tokens = int(data.get("max_tokens", DEFAULTS["max_tokens"])) if str(
-        data.get("max_tokens", "")).strip() else DEFAULTS["max_tokens"]
-    overlap_tokens = int(data.get("overlap_tokens", DEFAULTS["overlap_tokens"])) if str(
-        data.get("overlap_tokens", "")).strip() else DEFAULTS["overlap_tokens"]
-    bert_agg = str(data.get("bert_agg", DEFAULTS["bert_agg"]))
-    if bert_agg not in ("mean", "max"):
-        bert_agg = DEFAULTS["bert_agg"]
-
-    neg_label = _negative_label_from_le(LE)
-
-    # Se labels não foram fornecidas e auto_label ativo, gerar a partir do BERT atual
-    generated_labels = None
-    if (not labels_in) and auto_label:
-        generated_labels = []
-        for t in texts:
-            p = bert_probability_true_for_text(
-                CLF, LE, SBERT, CCFG, t, max_tokens=max_tokens, overlap_tokens=overlap_tokens, aggregate=bert_agg)
-            lab = "true" if (p >= thr * 100.0) else neg_label
-            generated_labels.append(lab)
-        labels_in = generated_labels
-
-    if not labels_in or len(labels_in) != len(texts):
-        return jsonify({"updated": 0, "error": "labels ausentes ou tamanho incorreto; ative auto_label ou envie labels."}), 400
-
-    # Normalizar labels para os rótulos do encoder
-    allowed = set(list(getattr(LE, "classes_", [])))
-    labels_final = []
-    for lab in labels_in:
-        if lab == "true":
-            labels_final.append(
-                "true" if "true" in allowed else list(allowed)[0])
-        else:
-            # mapear qualquer não-true para o rótulo negativo presente
-            labels_final.append(
-                neg_label if neg_label in allowed else list(allowed)[0])
-
-    try:
-        ok = ONLINE.update(texts, labels_final)
-    except Exception as e:
-        return jsonify({"updated": 0, "error": f"falha no update: {type(e).__name__}: {e}"}), 500
-
-    return jsonify({
-        "updated": int(ok) * len(texts),
-        "n_updates_total": getattr(ONLINE, "n_updates", 0),
-        "alpha": ONLINE.alpha() if ONLINE.is_trained() else 0.0,
-        "labels_used": labels_final,
-        "auto_label": auto_label,
-        "threshold": thr,
-    }), 200
 
 
 if __name__ == "__main__":
