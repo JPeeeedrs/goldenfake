@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Sequence, Set, TextIO, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 @dataclass
@@ -23,6 +25,22 @@ class FilterState:
 DEFAULT_API_ENDPOINT = "https://pt.wikipedia.org/w/api.php"
 CATEGORY_NAMESPACES = {"category", "categoria"}
 USER_AGENT = "GoldenFakeFilter/1.0 (+https://github.com/JPeeeedrs/goldenfake)"
+
+
+def create_retry_session(retries=3, backoff_factor=0.3, status_forcelist=(500, 502, 504)):
+    session = requests.Session()
+    retry = Retry(
+        total=retries,
+        read=retries,
+        connect=retries,
+        backoff_factor=backoff_factor,
+        status_forcelist=status_forcelist,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,13 +155,16 @@ def load_relevant_categories(path: Path, extras: Optional[Sequence[str]]) -> Set
     elif isinstance(data, list):
         items = extract_strings(data)
     else:
-        raise TypeError("Categories JSON must be a list or contain a 'categories' list")
+        raise TypeError(
+            "Categories JSON must be a list or contain a 'categories' list")
 
-    categories = {normalize_category_name(item) for item in items if isinstance(item, str)}
+    categories = {normalize_category_name(item)
+                  for item in items if isinstance(item, str)}
     if extras:
         categories.update(normalize_category_name(item) for item in extras)
     if not categories:
-        raise ValueError("No categories provided after processing the input JSON")
+        raise ValueError(
+            "No categories provided after processing the input JSON")
     return categories
 
 
@@ -279,7 +300,8 @@ def fetch_categories(
             try:
                 if delay:
                     time.sleep(delay)
-                response = session.get(endpoint, params=request_params, timeout=30)
+                response = session.get(
+                    endpoint, params=request_params, timeout=30)
                 response.raise_for_status()
                 payload = response.json()
                 break
@@ -296,16 +318,20 @@ def fetch_categories(
                     time.sleep(backoff)
                     continue
                 if attempt == retries - 1:
-                    raise RuntimeError(f"Failed to query categories for batch: {exc}") from exc
-                logging.warning("Retrying category fetch after HTTP error: %s", exc)
+                    raise RuntimeError(
+                        f"Failed to query categories for batch: {exc}") from exc
+                logging.warning(
+                    "Retrying category fetch after HTTP error: %s", exc)
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt == retries - 1:
-                    raise RuntimeError(f"Failed to query categories for batch: {exc}") from exc
+                    raise RuntimeError(
+                        f"Failed to query categories for batch: {exc}") from exc
                 logging.warning("Retrying category fetch after error: %s", exc)
         else:
             assert last_error is not None
-            raise RuntimeError(f"Failed to query categories for batch: {last_error}") from last_error
+            raise RuntimeError(
+                f"Failed to query categories for batch: {last_error}") from last_error
 
         assert payload is not None
 
@@ -355,18 +381,23 @@ def merge_state_with_progress(
     expected_output = str(args.output_path.resolve())
 
     if progress.get("articles_path") != expected_articles:
-        logging.warning("Progress file references a different articles file. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different articles file. Ignoring saved state.")
         return state, 0
     if progress.get("categories_path") != expected_categories:
-        logging.warning("Progress file references a different categories file. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different categories file. Ignoring saved state.")
         return state, 0
     if progress.get("output_path") != expected_output:
-        logging.warning("Progress file references a different output path. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different output path. Ignoring saved state.")
         return state, 0
 
-    saved_categories = {normalize_category_name(cat) for cat in progress.get("relevant_categories", [])}
+    saved_categories = {normalize_category_name(
+        cat) for cat in progress.get("relevant_categories", [])}
     if saved_categories and saved_categories != relevant_categories:
-        logging.warning("Relevant categories have changed. Saved state will be ignored.")
+        logging.warning(
+            "Relevant categories have changed. Saved state will be ignored.")
         return state, 0
 
     state.processed = progress.get("processed", 0)
@@ -391,20 +422,24 @@ def process_articles(args: argparse.Namespace) -> None:
     if args.max_retries < 1:
         raise ValueError("max-retries must be at least one")
 
-    relevant_categories = load_relevant_categories(args.categories_path, args.extra_category)
+    relevant_categories = load_relevant_categories(
+        args.categories_path, args.extra_category)
 
-    progress_path = args.progress_file or args.output_path.with_suffix(".progress.json")
+    progress_path = args.progress_file or args.output_path.with_suffix(
+        ".progress.json")
     if progress_path.exists() and not args.resume:
         progress_path.unlink()
 
     progress_payload = load_progress(progress_path) if args.resume else None
 
     state = FilterState()
-    state, skip_count = merge_state_with_progress(state, progress_payload, args, relevant_categories)
+    state, skip_count = merge_state_with_progress(
+        state, progress_payload, args, relevant_categories)
 
     sources = collect_article_sources(args.articles_path)
     append_output = state.written > 0
-    output_handle = prepare_output_handle(args.output_path, append=append_output)
+    output_handle = prepare_output_handle(
+        args.output_path, append=append_output)
 
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
@@ -450,7 +485,8 @@ def process_articles(args: argparse.Namespace) -> None:
                 articles_since_save,
             )
 
-        logging.info("Filtering completed: %d processed, %d kept.", state.processed, state.written)
+        logging.info("Filtering completed: %d processed, %d kept.",
+                     state.processed, state.written)
 
     except KeyboardInterrupt:
         logging.warning("Interrupted by user. Saving progress before exiting.")
@@ -460,7 +496,8 @@ def process_articles(args: argparse.Namespace) -> None:
     finally:
         output_handle.flush()
         output_handle.close()
-        persist_progress(progress_path, args, state, relevant_categories, finished=True)
+        persist_progress(progress_path, args, state,
+                         relevant_categories, finished=True)
 
 
 def handle_batch(
@@ -495,9 +532,11 @@ def handle_batch(
     output_handle.flush()
 
     if articles_since_save >= args.save_interval:
-        progress_path = args.progress_file or args.output_path.with_suffix(".progress.json")
+        progress_path = args.progress_file or args.output_path.with_suffix(
+            ".progress.json")
         persist_progress(progress_path, args, state, relevant_categories)
-        logging.info("Progress saved: %d processed, %d kept.", state.processed, state.written)
+        logging.info("Progress saved: %d processed, %d kept.",
+                     state.processed, state.written)
         articles_since_save = 0
     return state, articles_since_save
 

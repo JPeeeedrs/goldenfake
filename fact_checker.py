@@ -79,27 +79,29 @@ def extract_style_features(text: str) -> np.ndarray:
     letters = [c for c in t if c.isalpha()]
     n_letters = len(letters)
     n_upper = sum(1 for c in letters if c.isupper())
-    
+
     words = re.findall(r"\b\w+\b", t, flags=re.UNICODE)
     n_words = len(words)
     words_alpha = [w for w in words if any(ch.isalpha() for ch in w)]
-    n_allcaps_words = sum(1 for w in words_alpha if len(w) >= 3 and w.isupper())
-    
-    avg_word_len = _safe_div(sum(len(w) for w in words_alpha), len(words_alpha))
+    n_allcaps_words = sum(1 for w in words_alpha if len(w)
+                          >= 3 and w.isupper())
+
+    avg_word_len = _safe_div(sum(len(w)
+                             for w in words_alpha), len(words_alpha))
     ttr = _safe_div(len(set(w.lower() for w in words_alpha)), len(words_alpha))
-    
+
     punct_count = sum(1 for c in t if c in PUNCT_SET)
     punct_ratio = _safe_div(punct_count, max(n_chars, 1))
     upper_ratio = _safe_div(n_upper, max(n_letters, 1))
     allcaps_ratio = _safe_div(n_allcaps_words, max(n_words, 1))
-    
+
     exclam = min(t.count("!"), 10) / 10.0
     quest = min(t.count("?"), 10) / 10.0
-    
+
     low = t.lower()
     lex_count = sum(1 for kw in SENSATIONAL_LEXICON if kw in low)
     lex_density = _safe_div(lex_count, max(n_words, 1))
-    
+
     return np.array([
         upper_ratio, allcaps_ratio, punct_ratio,
         exclam, quest, min(avg_word_len, 20) / 20.0,
@@ -119,29 +121,31 @@ def _get_style_scaler():
 
 
 def chunk_text_optimized(model: SentenceTransformer, text: str,
-                        max_tokens: int = _DEFAULT_MAX_TOKENS,
-                        overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS) -> List[str]:
+                         max_tokens: int = _DEFAULT_MAX_TOKENS,
+                         overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS) -> List[str]:
     """Divide texto em chunks otimizado."""
     try:
         tokenizer = model.tokenizer
-        tokens = tokenizer.encode(text, add_special_tokens=False, truncation=False)
-        
+        tokens = tokenizer.encode(
+            text, add_special_tokens=False, truncation=False)
+
         if len(tokens) <= max_tokens:
             return [text]
-        
+
         chunks = []
         stride = max(1, max_tokens - overlap_tokens)
-        
+
         for start in range(0, len(tokens), stride):
             window = tokens[start:start + max_tokens]
             if not window:
                 break
-            chunk_text = tokenizer.decode(window, skip_special_tokens=True).strip()
+            chunk_text = tokenizer.decode(
+                window, skip_special_tokens=True).strip()
             if chunk_text:
                 chunks.append(chunk_text)
-        
+
         return chunks if chunks else [text]
-    
+
     except Exception:
         return [text]
 
@@ -149,16 +153,17 @@ def chunk_text_optimized(model: SentenceTransformer, text: str,
 def load_vector_store():
     """Carrega índice FAISS e metadados."""
     if not all(os.path.isfile(p) for p in [INDEX_PATH, META_PATH, VEC_CONFIG_PATH]):
-        raise FileNotFoundError("Vector store não encontrado. Execute build_faiss_index.py")
-    
+        raise FileNotFoundError(
+            "Vector store não encontrado. Execute build_faiss_index.py")
+
     index = faiss.read_index(INDEX_PATH)
-    
+
     with open(META_PATH, "r", encoding="utf-8") as f:
         metadata = json.load(f)
-    
+
     with open(VEC_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    
+
     logger.info(f"FAISS carregado: {index.ntotal} vetores")
     return index, metadata, cfg
 
@@ -166,18 +171,20 @@ def load_vector_store():
 def load_classifier():
     """Carrega classificador XGBoost calibrado."""
     if not all(os.path.isfile(p) for p in [CLS_PATH, LE_PATH, CLS_CONFIG_PATH]):
-        raise FileNotFoundError("Modelo não encontrado. Execute train_classifier.py")
-    
+        raise FileNotFoundError(
+            "Modelo não encontrado. Execute train_classifier.py")
+
     clf = joblib.load(CLS_PATH)
     le = joblib.load(LE_PATH)
-    
+
     with open(CLS_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    
-    embed_model = cfg.get("embed_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+
+    embed_model = cfg.get(
+        "embed_model", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
     sbert = SentenceTransformer(embed_model)
     sbert.max_seq_length = int(cfg.get("max_seq_length", 512))
-    
+
     logger.info(f"Classificador carregado: {type(clf).__name__}")
     return clf, le, sbert, cfg
 
@@ -196,54 +203,54 @@ def embed_query(model: SentenceTransformer, text: str, normalize: bool = True) -
 def embed_query_with_style(model: SentenceTransformer, text: str, cfg: Dict) -> np.ndarray:
     """Gera embedding com features de estilo opcionais."""
     base = embed_query(model, text, normalize=True)
-    
+
     if not cfg.get("style_features"):
         return base
-    
+
     scaler = _get_style_scaler()
     if scaler is None:
         return base
-    
+
     style = extract_style_features(text).reshape(1, -1)
     style_scaled = scaler.transform(style)
-    
+
     # Aplicar peso do estilo
     style_weight = float(cfg.get("style_weight", 0.15))
     style_weighted = style_scaled * style_weight
-    
+
     return np.hstack([base, style_weighted.astype(np.float32)])
 
 
 def historical_consistency_for_text(index, model: SentenceTransformer, text: str,
-                                   k: int = 8,
-                                   max_tokens: int = _DEFAULT_MAX_TOKENS,
-                                   overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
-                                   aggregate: str = "max") -> Tuple[float, List]:
+                                    k: int = 8,
+                                    max_tokens: int = _DEFAULT_MAX_TOKENS,
+                                    overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
+                                    aggregate: str = "max") -> Tuple[float, List]:
     """Calcula consistência histórica com FAISS usando chunking e agregação."""
     chunks = chunk_text_optimized(model, text, max_tokens, overlap_tokens)
-    
+
     if not chunks:
         return 0.0, []
-    
+
     scores = []
     all_neighbors = []
-    
+
     for chunk in chunks:
         q_emb = embed_query(model, chunk, normalize=True)
-        
+
         if index.ntotal == 0:
             return 0.0, []
-        
+
         D, I = index.search(q_emb, k)
         sims = np.clip(D[0], 0.0, 1.0)
         score = float(np.mean(sims)) * 100.0
-        
+
         scores.append(score)
         all_neighbors.append(list(zip(I[0].tolist(), sims.tolist())))
-    
+
     if not scores:
         return 0.0, []
-    
+
     if aggregate == "mean":
         final_score = float(np.mean(scores))
         # Retornar vizinhos do melhor chunk
@@ -255,31 +262,32 @@ def historical_consistency_for_text(index, model: SentenceTransformer, text: str
 
 
 def bert_probability_true_for_text(clf, le, model: SentenceTransformer, cfg: Dict,
-                                  text: str,
-                                  max_tokens: int = _DEFAULT_MAX_TOKENS,
-                                  overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
-                                  aggregate: str = "mean") -> float:
+                                   text: str,
+                                   max_tokens: int = _DEFAULT_MAX_TOKENS,
+                                   overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
+                                   aggregate: str = "mean") -> float:
     """Calcula probabilidade 'true' usando BERT com chunking."""
     chunks = chunk_text_optimized(model, text, max_tokens, overlap_tokens)
-    
+
     if not chunks:
         return 0.0
-    
+
     # Processar todos os chunks em batch
-    embeddings = [embed_query_with_style(model, chunk, cfg) for chunk in chunks]
+    embeddings = [embed_query_with_style(
+        model, chunk, cfg) for chunk in chunks]
     X = np.vstack(embeddings)
-    
+
     # Predição em batch
     proba = clf.predict_proba(X)
-    
+
     # Identificar índice da classe 'true'
     try:
         idx_true = list(le.classes_).index("true")
     except ValueError:
         idx_true = int(np.argmax(proba[0]))
-    
+
     probs_true = proba[:, idx_true] * 100.0
-    
+
     if aggregate == "max":
         return float(np.max(probs_true))
     else:  # mean
@@ -287,41 +295,67 @@ def bert_probability_true_for_text(clf, le, model: SentenceTransformer, cfg: Dic
 
 
 def blend_score_with_entities(base_score: float,
-                             entity_block: Dict[str, Any] | None,
-                             weight: float = ENTITY_BERT_WEIGHT) -> Tuple[float, float | None]:
+                              entity_block: Dict[str, Any] | None,
+                              weight: float = ENTITY_BERT_WEIGHT) -> Tuple[float, float | None]:
     """Combina score base com média de entidades verificadas."""
     if not entity_block:
         return base_score, None
-    
+
     avg_pct = entity_block.get("media_percent")
     total = entity_block.get("total", 0)
-    
+
     if avg_pct is None or total <= 0:
         return base_score, None
-    
+
     avg_pct = max(0.0, min(100.0, float(avg_pct)))
     weight = max(0.0, min(1.0, float(weight)))
-    
+
     blended = (1.0 - weight) * base_score + weight * avg_pct
     return blended, avg_pct
 
 
-def fuse_scores(hist_score: float, bert_score: float, fonte_score: float | None = None,
-               w_hist: float = 0.4, w_bert: float = 0.3, w_fontes: float = 0.3) -> float:
-    """Fusão ponderada de scores."""
-    weights = np.array([w_hist, w_bert, w_fontes], dtype=np.float32)
-    scores = np.array([
-        hist_score if hist_score is not None else 0.0,
-        bert_score if bert_score is not None else 0.0,
-        fonte_score if fonte_score is not None else 0.0
-    ], dtype=np.float32)
-    
-    # Normalizar pesos
-    weight_sum = weights.sum()
+def fuse_scores(hist_score: float | None, bert_score: float | None, fonte_score: float | None,
+                w_hist: float = 0.4, w_bert: float = 0.3, w_fontes: float = 0.3) -> float:
+    """
+    Fusão ponderada dinâmica. 
+    Se um componente for None (erro/indisponível), seus pesos são redistribuídos.
+    """
+    # Lista de tuplas: (score, peso_original)
+    components = [
+        (hist_score, w_hist),
+        (bert_score, w_bert),
+        (fonte_score, w_fontes)
+    ]
+
+    valid_scores = []
+    valid_weights = []
+
+    for score, weight in components:
+        # Só aceita se não for None e for maior ou igual a 0
+        if score is not None and score >= 0:
+            valid_scores.append(score)
+            valid_weights.append(weight)
+
+    # Se todos falharam (lista vazia), retorna Neutro (50.0)
+    if not valid_scores:
+        return 50.0
+
+    # Converter para numpy para cálculo vetorial
+    scores_np = np.array(valid_scores, dtype=np.float32)
+    weights_np = np.array(valid_weights, dtype=np.float32)
+
+    # Renormalizar os pesos para que a soma seja 1.0
+    # Ex: Se sobrar só w_bert(0.3) e w_fontes(0.3), a soma é 0.6.
+    # Nós dividimos cada um por 0.6 para virarem 0.5 e 0.5.
+    weight_sum = weights_np.sum()
+
     if weight_sum > 0:
-        weights = weights / weight_sum
-    
-    return float(np.dot(weights, scores))
+        weights_np = weights_np / weight_sum
+    else:
+        # Caso de segurança matemático extremo
+        return float(np.mean(scores_np))
+
+    return float(np.dot(weights_np, scores_np))
 
 
 def classify_text(final_score: float) -> Tuple[str, float]:
@@ -346,27 +380,27 @@ def _wiki_opensearch_titles(query: str, limit: int = 3) -> List[Tuple[str, str]]
         r = requests.get(url, params=params, timeout=3)
         r.raise_for_status()
         data = r.json()
-        
+
         titles = data[1] if len(data) > 1 else []
         links = data[3] if len(data) > 3 else []
-        
+
         return [(titles[i], links[i]) for i in range(min(len(titles), len(links)))]
     except Exception:
         return []
 
 
 def wikipedia_dynamic_neighbors(model: SentenceTransformer, query_text: str,
-                               titles_limit: int = 3, k: int = 8,
-                               max_tokens: int = _DEFAULT_MAX_TOKENS) -> Tuple[float, List[Dict]]:
+                                titles_limit: int = 3, k: int = 8,
+                                max_tokens: int = _DEFAULT_MAX_TOKENS) -> Tuple[float, List[Dict]]:
     """Busca dinâmica na Wikipedia e retorna score de similaridade."""
     titles = _wiki_opensearch_titles(query_text, limit=titles_limit)
     if not titles:
         return 0.0, []
-    
+
     # Simplified: apenas retornar score base e títulos
     # A implementação completa requer fetch do conteúdo das páginas
     q_emb = embed_query(model, query_text, normalize=True)
-    
+
     details = []
     for title, url in titles:
         details.append({
@@ -374,28 +408,28 @@ def wikipedia_dynamic_neighbors(model: SentenceTransformer, query_text: str,
             "url": url,
             "similaridade": 0.5  # Placeholder
         })
-    
+
     score = 50.0  # Score base para Wikipedia
     return score, details
 
 
 def combined_historical_consistency_for_text(index, model: SentenceTransformer,
-                                            text: str, k: int = 8,
-                                            max_tokens: int = _DEFAULT_MAX_TOKENS,
-                                            overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
-                                            aggregate: str = "max",
-                                            wiki_titles: int = 3,
-                                            w_faiss: float = 0.7,
-                                            w_wiki: float = 0.3) -> Tuple[float, Dict]:
+                                             text: str, k: int = 8,
+                                             max_tokens: int = _DEFAULT_MAX_TOKENS,
+                                             overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
+                                             aggregate: str = "max",
+                                             wiki_titles: int = 3,
+                                             w_faiss: float = 0.7,
+                                             w_wiki: float = 0.3) -> Tuple[float, Dict]:
     """Combina FAISS e Wikipedia."""
     faiss_score, neighbors = historical_consistency_for_text(
         index, model, text, k, max_tokens, overlap_tokens, aggregate
     )
-    
+
     wiki_score, wiki_details = wikipedia_dynamic_neighbors(
         model, text, wiki_titles, k, max_tokens
     )
-    
+
     # Normalizar pesos
     if wiki_score <= 0:
         combined = faiss_score
@@ -408,7 +442,7 @@ def combined_historical_consistency_for_text(index, model: SentenceTransformer,
         wf = w_faiss / total
         ww = w_wiki / total
         combined = faiss_score * wf + wiki_score * ww
-    
+
     return combined, {
         "faiss": {"score": round(faiss_score, 1), "vizinhos": neighbors},
         "wikipedia": {"score": round(wiki_score, 1), "matches": wiki_details},
@@ -431,13 +465,13 @@ def fetch_wikipedia_article(page_id: str) -> Dict | None:
         }
         r = requests.get(url, params=params, timeout=4)
         r.raise_for_status()
-        
+
         data = r.json().get("query", {}).get("pages", {})
         page = data.get(str(page_id))
-        
+
         if not page or page.get("missing"):
             return None
-        
+
         return {
             "id": page_id,
             "title": page.get("title"),
@@ -455,25 +489,26 @@ def faiss_claim_corroboration(neighbors: List[Tuple[int, float]],
     """Verifica corroboração da claim nos artigos mais similares do FAISS."""
     if not neighbors or not metadata:
         return None
-    
+
     # Extrair keywords simples da claim
     claim_tokens = set(re.findall(r'\b\w{4,}\b', claim_text.lower()))
-    
+
     results = []
     max_corroboration = 0.0
-    
+    fetched_count = 0
+
     for idx, similarity in neighbors[:top_articles]:
         if idx < 0 or idx >= len(metadata):
             continue
-        
+
         entry = metadata[idx]
         page_id = entry.get("id")
-        
+
         if not page_id:
             continue
-        
+
         article = fetch_wikipedia_article(str(page_id))
-        
+
         if not article:
             results.append({
                 "page_id": str(page_id),
@@ -481,19 +516,20 @@ def faiss_claim_corroboration(neighbors: List[Tuple[int, float]],
                 "status": "unavailable"
             })
             continue
-        
+
+        fetched_count += 1
         # Verificar overlap de tokens
         article_text = article.get("text", "").lower()
         article_tokens = set(re.findall(r'\b\w{4,}\b', article_text))
-        
+
         matched = claim_tokens & article_tokens
         ratio = len(matched) / len(claim_tokens) if claim_tokens else 0.0
-        
+
         status = "corroborated" if ratio >= 0.6 else \
                  "partially_corroborated" if ratio >= 0.3 else "not_corroborated"
-        
+
         max_corroboration = max(max_corroboration, ratio)
-        
+
         results.append({
             "page_id": str(page_id),
             "title": article.get("title"),
@@ -502,10 +538,19 @@ def faiss_claim_corroboration(neighbors: List[Tuple[int, float]],
             "status": status,
             "corroboration_ratio": round(ratio, 3)
         })
-    
+
+    # Se não conseguiu baixar nenhum artigo (ex: dataset local ou sem internet),
+    # retorna None no score para não penalizar o resultado bruto.
+    if fetched_count == 0:
+        return {
+            "status": "unavailable",
+            "corroboration_score": None,
+            "articles": results
+        }
+
     overall_status = "corroborated" if max_corroboration >= 0.6 else \
                      "partially_corroborated" if max_corroboration >= 0.3 else "not_corroborated"
-    
+
     return {
         "status": overall_status,
         "corroboration_score": round(max_corroboration, 3),
@@ -516,7 +561,7 @@ def faiss_claim_corroboration(neighbors: List[Tuple[int, float]],
 # CLI simplificada
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Fact Checker otimizado")
     parser.add_argument("--text", type=str, help="Texto a analisar")
     parser.add_argument("--k", type=int, default=8, help="Vizinhos FAISS")
@@ -525,27 +570,28 @@ def main():
     parser.add_argument("--w_fontes", type=float, default=0.3)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    
+
     text = args.text or input("Texto para análise:\n")
     if not text.strip():
         print("Texto vazio")
         return
-    
+
     # Carregar modelos
     index, metadata, _ = load_vector_store()
     clf, le, sbert, cfg = load_classifier()
-    
+
     # Análise
-    hist_score, neighbors = historical_consistency_for_text(index, sbert, text, k=args.k)
+    hist_score, neighbors = historical_consistency_for_text(
+        index, sbert, text, k=args.k)
     bert_score = bert_probability_true_for_text(clf, le, sbert, cfg, text)
-    
+
     # Fonte score (placeholder - requer external_sources.py)
     fonte_score = 50.0
-    
+
     final_score = fuse_scores(hist_score, bert_score, fonte_score,
-                            args.w_hist, args.w_bert, args.w_fontes)
+                              args.w_hist, args.w_bert, args.w_fontes)
     label, _ = classify_text(final_score)
-    
+
     result = {
         "texto": text,
         "historico": {"score": round(hist_score, 1), "k": args.k},
@@ -553,7 +599,7 @@ def main():
         "fontes": {"score": round(fonte_score, 1)},
         "final": {"label": label, "score": round(final_score, 1)}
     }
-    
+
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

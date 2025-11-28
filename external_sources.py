@@ -57,7 +57,7 @@ ENTITY_SCORE_RULES = {
 }
 ENTITY_STATUS_LABELS = {
     "strong": "Corroboração forte",
-    
+
     "weak": "Corroboração fraca",
     "missing": "Bolha de vácuo",
 }
@@ -99,6 +99,7 @@ FACT_CHECK_SIM_THRESHOLD = 0.3
 # Substitui o carregamento via variáveis de ambiente por leitura direta de .env
 _DEF_ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 
+
 def _read_env(path: str = _DEF_ENV_PATH) -> Dict[str, str]:
     env: Dict[str, str] = {}
     try:
@@ -119,7 +120,9 @@ def _read_env(path: str = _DEF_ENV_PATH) -> Dict[str, str]:
         logger.debug("Falha ao ler .env", exc_info=True)
     return env
 
+
 ENV = _read_env()
+
 
 def _get_spacy_model():
     global _SPACY_NLP
@@ -131,7 +134,8 @@ def _get_spacy_model():
     try:
         _SPACY_NLP = spacy.load("pt_core_news_sm")
     except Exception:
-        logger.warning("Falha ao carregar modelo spaCy pt_core_news_sm", exc_info=True)
+        logger.warning(
+            "Falha ao carregar modelo spaCy pt_core_news_sm", exc_info=True)
         _SPACY_NLP = None
     return _SPACY_NLP
 
@@ -395,6 +399,7 @@ def _store_gemini_result(claim: str, result: Dict[str, Any]) -> None:
     while len(GEMINI_CACHE) > GEMINI_CACHE_MAX:
         GEMINI_CACHE.popitem(last=False)
 
+
 # Domínios de checagem de fatos PT/ES comuns
 FACT_CHECK_DOMAINS = {
     "aosfatos.org": "Aos Fatos",
@@ -433,7 +438,8 @@ TRUSTED_DOMAINS = {
 SOCIAL_DOMAINS = {
     "instagram.com", "x.com", "twitter.com", "facebook.com", "fb.com", "pinterest.com", "bsky.app", "bsky.social", "threads.net",
 }
-SOCIAL_PUBLISHER_NAMES = {"instagram", "x", "twitter", "facebook", "pinterest", "bluesky", "threads"}
+SOCIAL_PUBLISHER_NAMES = {"instagram", "x", "twitter",
+                          "facebook", "pinterest", "bluesky", "threads"}
 
 
 def _get_domain(url: str) -> str:
@@ -502,7 +508,8 @@ def extract_claims(text: str, max_claims: int = 3) -> List[str]:
 
 
 def _cosine_sim(model: SentenceTransformer, a: str, b: str) -> float:
-    embs = model.encode([a, b], convert_to_numpy=True, normalize_embeddings=True)
+    embs = model.encode([a, b], convert_to_numpy=True,
+                        normalize_embeddings=True)
     return float(np.dot(embs[0], embs[1]))
 
 
@@ -517,7 +524,8 @@ def _filter_fact_checks_by_similarity(
 
     filtered: List[Dict[str, Any]] = []
     for ev in evidences:
-        ref_text = ev.get("claim_text") or ev.get("claim") or ev.get("title") or ""
+        ref_text = ev.get("claim_text") or ev.get(
+            "claim") or ev.get("title") or ""
         similarity = _cosine_sim(sbert, claim, ref_text) if ref_text else 0.0
         if similarity < threshold:
             continue
@@ -541,7 +549,8 @@ def query_google_factcheck(claim: str, api_key: str, language: str = "pt-BR") ->
     try:
         r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
-            logger.warning(f"FactCheck API status {r.status_code}: {r.text[:200]}")
+            logger.warning(
+                f"FactCheck API status {r.status_code}: {r.text[:200]}")
             return []
         data = r.json()
         items = []
@@ -752,7 +761,8 @@ def query_bing(claim: str, api_key: str, mkt: str = "pt-BR") -> List[Dict[str, A
 
 def _classify_entity_results(results: List[Dict[str, Any]], provider: str | None = None) -> Tuple[str, float]:
     if not results:
-        score_map = ENTITY_SCORE_RULES.get(provider) or ENTITY_SCORE_RULES["default"]
+        score_map = ENTITY_SCORE_RULES.get(
+            provider) or ENTITY_SCORE_RULES["default"]
         return "missing", score_map["missing"]
     trusted_hits = 0
     weak_hits = 0
@@ -771,7 +781,8 @@ def _classify_entity_results(results: List[Dict[str, Any]], provider: str | None
         status = "weak"
     else:
         status = "weak"
-    score_map = ENTITY_SCORE_RULES.get(provider) or ENTITY_SCORE_RULES["default"]
+    score_map = ENTITY_SCORE_RULES.get(
+        provider) or ENTITY_SCORE_RULES["default"]
     return status, score_map[status]
 
 
@@ -796,7 +807,8 @@ def verify_entities_with_serpapi(text: str, api_key: str) -> Dict[str, Any]:
                     if res:
                         provider_used = "kg"
                 except Exception:
-                    logger.exception("Erro na consulta ao Knowledge Graph API para %s", ent)
+                    logger.exception(
+                        "Erro na consulta ao Knowledge Graph API para %s", ent)
                     res = []
             # fallback to SerpAPI only if KG returned nothing
             if not res and api_key:
@@ -805,7 +817,8 @@ def verify_entities_with_serpapi(text: str, api_key: str) -> Dict[str, Any]:
                     if res:
                         provider_used = "serp"
                 except Exception:
-                    logger.exception("Erro na consulta ao SerpAPI para %s", ent)
+                    logger.exception(
+                        "Erro na consulta ao SerpAPI para %s", ent)
                     res = []
         except Exception:
             res = []
@@ -827,6 +840,7 @@ def verify_entities_with_serpapi(text: str, api_key: str) -> Dict[str, Any]:
             "status": status,
             "rotulo": ENTITY_STATUS_LABELS.get(status, status),
             "score": round(score, 2),
+            "percent": round(score * 100.0, 1),
             "resultados": top,
             "total_resultados": len(res),
             "provider": provider_used,
@@ -834,7 +848,8 @@ def verify_entities_with_serpapi(text: str, api_key: str) -> Dict[str, Any]:
         time.sleep(ENTITY_SEARCH_SLEEP)
     if not results_block:
         return {}
-    avg_score = sum(item["score"] for item in results_block) / max(1, len(results_block))
+    avg_score = sum(item["score"]
+                    for item in results_block) / max(1, len(results_block))
     return {
         "entidades": results_block,
         "media_score": round(avg_score, 3),
@@ -863,7 +878,8 @@ def query_kg(query: str, api_key: str, limit: int = 5, languages: str = "pt") ->
     try:
         r = requests.get(url, params=params, timeout=8)
         if r.status_code != 200:
-            logger.warning("Knowledge Graph status %s: %s", r.status_code, r.text[:200])
+            logger.warning("Knowledge Graph status %s: %s",
+                           r.status_code, r.text[:200])
             return []
         data = r.json()
         items = []
@@ -901,9 +917,11 @@ def query_gemini_factcheck(claim: str, api_key: str, context: List[Dict[str, Any
     for item in evidences:
         title = item.get("title") or item.get("url") or "(sem título)"
         publisher = item.get("publisher") or item.get("provider") or ""
-        snippet = item.get("snippet") or item.get("description") or item.get("claim_text") or ""
+        snippet = item.get("snippet") or item.get(
+            "description") or item.get("claim_text") or ""
         snippet_clean = snippet.strip().replace("\n", " ")[:260]
-        evidence_snippets.append(f"- {title} ({publisher}): {snippet_clean}".strip())
+        evidence_snippets.append(
+            f"- {title} ({publisher}): {snippet_clean}".strip())
     instructions = [
         "Você é um algoritmo de verificação cético.",
         "Analise a afirmação baseada EXCLUSIVAMENTE no contexto fornecido. Ignore qualquer conhecimento prévio.",
@@ -918,7 +936,8 @@ def query_gemini_factcheck(claim: str, api_key: str, context: List[Dict[str, Any
         instructions.append("Contexto:")
         instructions.extend(evidence_snippets)
     else:
-        instructions.append("Contexto: (nenhum fornecido; trate como ausência total de evidências)")
+        instructions.append(
+            "Contexto: (nenhum fornecido; trate como ausência total de evidências)")
     payload = {
         "contents": [
             {
@@ -941,7 +960,8 @@ def query_gemini_factcheck(claim: str, api_key: str, context: List[Dict[str, Any
                 timeout=GEMINI_TIMEOUT_SECONDS,
             )
             if resp.status_code != 200:
-                logger.warning("Gemini API status %s: %s", resp.status_code, resp.text[:200])
+                logger.warning("Gemini API status %s: %s",
+                               resp.status_code, resp.text[:200])
                 return None
             data = resp.json()
             candidates = data.get("candidates") or []
@@ -989,8 +1009,10 @@ def query_gemini_factcheck(claim: str, api_key: str, context: List[Dict[str, Any
         if attempt < max_retries:
             time.sleep(min(1.5 * attempt, 4.0))
     if last_error:
-        logger.warning("Gemini API indisponível após %s tentativas: %s", max_retries, last_error)
-    fallback = {"score": 0.0, "raw_response": "0", "context_used": list(evidence_snippets)}
+        logger.warning(
+            "Gemini API indisponível após %s tentativas: %s", max_retries, last_error)
+    fallback = {"score": 0.0, "raw_response": "0",
+                "context_used": list(evidence_snippets)}
     _store_gemini_result(claim, fallback)
     return copy.deepcopy(fallback)
 
@@ -1055,10 +1077,11 @@ FACT_CHECK_FALSE_KEYWORDS = {
 # Stopwords básicas PT/EN para evitar contar palavras funcionais
 STOPWORDS = {
     # pt
-    "a","o","as","os","um","uma","uns","umas","de","do","da","dos","das","e","em","no","na","nos","nas","por","para","com","sem","sobre","entre","até","após","antes","como","que","se","sua","seu","suas","seus","é","foi","ser","são","era","ao","à","às","aos","mais","menos","muito","muita","muitas","muitos","já","não","sim","também","ou","onde","quando","porque","porquê","qual","quais","qualquer","toda","todo","todas","todos","há","teve","ter","tem","têm","desde","contra","meu","minha","meus","minhas",
+    "a", "o", "as", "os", "um", "uma", "uns", "umas", "de", "do", "da", "dos", "das", "e", "em", "no", "na", "nos", "nas", "por", "para", "com", "sem", "sobre", "entre", "até", "após", "antes", "como", "que", "se", "sua", "seu", "suas", "seus", "é", "foi", "ser", "são", "era", "ao", "à", "às", "aos", "mais", "menos", "muito", "muita", "muitas", "muitos", "já", "não", "sim", "também", "ou", "onde", "quando", "porque", "porquê", "qual", "quais", "qualquer", "toda", "todo", "todas", "todos", "há", "teve", "ter", "tem", "têm", "desde", "contra", "meu", "minha", "meus", "minhas",
     # en
-    "the","a","an","and","or","of","in","on","for","to","from","by","with","without","as","at","that","this","these","those","is","are","was","were","be","been","being","it","its","into","their","there","here","not","yes","no","also","any","all","more","less",
+    "the", "a", "an", "and", "or", "of", "in", "on", "for", "to", "from", "by", "with", "without", "as", "at", "that", "this", "these", "those", "is", "are", "was", "were", "be", "been", "being", "it", "its", "into", "their", "there", "here", "not", "yes", "no", "also", "any", "all", "more", "less",
 }
+
 
 def _tokenize(text: str) -> List[str]:
     if not text:
@@ -1135,9 +1158,12 @@ NEWS_DOMAINS = {
 }
 
 BLOG_DOMAINS = {"medium.com", "blogspot.com", "wordpress.com", "substack.com"}
-FORUM_DOMAINS = {"reddit.com", "quora.com", "stackexchange.com", "stackoverflow.com"}
-VIDEO_DOMAINS = {"youtube.com", "youtu.be", "vimeo.com", "dailymotion.com", "tiktok.com"}
-WIKI_DOMAINS = {"wikipedia.org", "wikinews.org", "wikiversity.org", "wikibooks.org"}
+FORUM_DOMAINS = {"reddit.com", "quora.com",
+                 "stackexchange.com", "stackoverflow.com"}
+VIDEO_DOMAINS = {"youtube.com", "youtu.be",
+                 "vimeo.com", "dailymotion.com", "tiktok.com"}
+WIKI_DOMAINS = {"wikipedia.org", "wikinews.org",
+                "wikiversity.org", "wikibooks.org"}
 PR_DOMAINS = {"prnewswire.com", "businesswire.com", "globenewswire.com"}
 
 
@@ -1312,7 +1338,8 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
     # Média das 10 primeiras evidências; se houver menos de 10, dividir por 10 mesmo assim (padding zero)
     if not top:
         return 0.0, []
-    sum_top_scores = float(sum(it.get("score", 0.0) for it in top))  # score está em [0,1]
+    sum_top_scores = float(sum(it.get("score", 0.0)
+                           for it in top))  # score está em [0,1]
     avg_top10_pct = (sum_top_scores / 10.0) * 100.0
     return avg_top10_pct, top
 
@@ -1323,7 +1350,8 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
         claims = [text]
 
     # Ler chaves somente do .env local
-    google_key = ENV.get("FACT_CHECK_API_KEY") or ENV.get("GOOGLE_FACTCHECK_API_KEY")
+    google_key = ENV.get("FACT_CHECK_API_KEY") or ENV.get(
+        "GOOGLE_FACTCHECK_API_KEY")
     newsapi_key = ENV.get("NEWSAPI_KEY") or ENV.get("NEWS_API_KEY")
     serpapi_key = ENV.get("SERPAPI_KEY")
     bing_key = ENV.get("BING_SEARCH_KEY")
@@ -1334,8 +1362,10 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
     claim_percentages: List[float] = []
 
     for c in claims:
-        _level1_evidences_raw, news_general_context = _query_fact_checks_for_text(c, google_key, newsapi_key)
-        level1_evidences = _filter_fact_checks_by_similarity(c, _level1_evidences_raw, sbert)
+        _level1_evidences_raw, news_general_context = _query_fact_checks_for_text(
+            c, google_key, newsapi_key)
+        level1_evidences = _filter_fact_checks_by_similarity(
+            c, _level1_evidences_raw, sbert)
         gemini_block: Dict[str, Any] | None = None
         context_hits: List[Dict[str, Any]] = []
         nivel_utilizado = NIVEL_1 if level1_evidences else NIVEL_2
@@ -1358,9 +1388,11 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
             nivel2_total = len(context_hits)
             results = list(context_hits)
             if gemini_key:
-                gemini_res = query_gemini_factcheck(c, gemini_key, context=context_hits)
+                gemini_res = query_gemini_factcheck(
+                    c, gemini_key, context=context_hits)
                 if gemini_res and isinstance(gemini_res.get("score"), (int, float)):
-                    percent_true = max(0.0, min(100.0, float(gemini_res["score"])))
+                    percent_true = max(
+                        0.0, min(100.0, float(gemini_res["score"])))
                     verdict_label = _gemini_verdict_from_score(percent_true)
                     context_summary = _summarize_context_hits(context_hits)
                     gemini_block = {
@@ -1402,7 +1434,8 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
         # Evitar rate limits agressivos
         time.sleep(0.3)
 
-    fonte_score = sum(claim_percentages) / len(claim_percentages) if claim_percentages else 0.0
+    fonte_score = sum(claim_percentages) / \
+        len(claim_percentages) if claim_percentages else 0.0
     fonte_score = max(0.0, min(100.0, fonte_score))
 
     try:

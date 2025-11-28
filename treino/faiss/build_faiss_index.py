@@ -6,15 +6,26 @@ from tqdm import tqdm
 import time
 
 # --- Configuração de Entrada (Seus arquivos) ---
+# A pasta onde o generate_embeddings.py salva os arquivos (padrão é 'embeddings' ao lado dele)
 EMBEDDINGS_DIR = Path(__file__).parent.resolve() / "embeddings"
-METADATA_FILE = EMBEDDINGS_DIR / "metadata_final.json"
-EMBEDDINGS_FILE = EMBEDDINGS_DIR / "embeddings_final.npz"
 
-# --- Configuração de Saída (Nomes de arquivo que você quer) ---
-OUTPUT_INDEX_FILE = EMBEDDINGS_DIR / "faiss_index.bin"
-OUTPUT_METADATA_FILE = EMBEDDINGS_DIR / "faiss_metadata.json"
-OUTPUT_CONFIG_FILE = EMBEDDINGS_DIR / "faiss_config.json"
-OUTPUT_PROGRESS_FILE = EMBEDDINGS_DIR / "faiss_build.progress.json"
+# O generate_embeddings.py gera 'embeddings_all.npz' e 'metadata_all.json'
+METADATA_FILE = EMBEDDINGS_DIR / "metadata_all.json"
+EMBEDDINGS_FILE = EMBEDDINGS_DIR / "embeddings_all.npz"
+
+# --- Configuração de Saída (Onde o app espera os arquivos) ---
+# Aponta para a pasta vector_store na raiz do projeto
+# Sobe 2 níveis: treino/faiss -> treino -> raiz
+PROJECT_ROOT = Path(__file__).parents[2]
+VECTOR_STORE_DIR = PROJECT_ROOT / "vector_store"
+
+# Garante que a pasta de saída existe
+VECTOR_STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+OUTPUT_INDEX_FILE = VECTOR_STORE_DIR / "faiss_index.bin"
+OUTPUT_METADATA_FILE = VECTOR_STORE_DIR / "faiss_metadata.json"
+OUTPUT_CONFIG_FILE = VECTOR_STORE_DIR / "faiss_config.json"
+OUTPUT_PROGRESS_FILE = VECTOR_STORE_DIR / "faiss_build.progress.json"
 
 # Modelo usado para gerar os embeddings (para o config.json)
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -33,21 +44,22 @@ start_time = time.time()
 npz_file = np.load(EMBEDDINGS_FILE)
 
 # index_map será o 'faiss_metadata.json' de saída (uma lista)
-index_map = [] 
+index_map = []
 embedding_list = []
-d = 0 # Dimensão dos embeddings
+d = 0  # Dimensão dos embeddings
 
 print("Lendo embeddings do arquivo NPZ...")
 
 # Itera sobre os metadados para garantir a ordem correta
 for article_id in tqdm(metadata.keys(), desc="Lendo arrays do NPZ"):
     if article_id not in npz_file:
-        print(f"Aviso: Artigo ID {article_id} dos metadados não encontrado no NPZ.")
+        print(
+            f"Aviso: Artigo ID {article_id} dos metadados não encontrado no NPZ.")
         continue
 
     # Carrega o array de embeddings para este artigo
     embs_array = npz_file[article_id]
-    
+
     if d == 0:
         # Detecta a dimensão do embedding no primeiro item
         d = embs_array.shape[1]
@@ -55,7 +67,7 @@ for article_id in tqdm(metadata.keys(), desc="Lendo arrays do NPZ"):
 
     # Adiciona os embeddings à nossa lista principal
     embedding_list.append(embs_array.astype('float32'))
-    
+
     # Cria o mapa de volta para o artigo/chunk
     # Este será o nosso 'faiss_metadata.json'
     num_chunks = embs_array.shape[0]
@@ -77,7 +89,8 @@ print(f"Total de vetores: {all_embeddings.shape[0]:,}")
 print(f"Dimensão do vetor: {all_embeddings.shape[1]}")
 
 if all_embeddings.shape[0] != len(index_map):
-    raise ValueError("Erro: O número de embeddings não bate com o mapa do índice!")
+    raise ValueError(
+        "Erro: O número de embeddings não bate com o mapa do índice!")
 
 print("Construindo o índice FAISS (IndexFlatIP)...")
 index = faiss.IndexFlatIP(d)
@@ -97,7 +110,8 @@ faiss.write_index(index, str(OUTPUT_INDEX_FILE))
 # 2. Salvar o mapa (o index_map que criamos)
 print(f"Salvando mapa do índice em {OUTPUT_METADATA_FILE}...")
 with open(OUTPUT_METADATA_FILE, 'w') as f:
-    json.dump(index_map, f) # Salva sem indentação para ser mais rápido/compacto
+    # Salva sem indentação para ser mais rápido/compacto
+    json.dump(index_map, f)
 
 # 3. Salvar o arquivo de configuração
 print(f"Salvando configuração em {OUTPUT_CONFIG_FILE}...")
@@ -114,7 +128,8 @@ with open(OUTPUT_CONFIG_FILE, 'w') as f:
 # 4. Salvar o arquivo de progresso (completo)
 print(f"Salvando progresso em {OUTPUT_PROGRESS_FILE}...")
 progress_payload = {
-    "processed_files": list(metadata.keys()), # Lista de todos os IDs de artigos
+    # Lista de todos os IDs de artigos
+    "processed_files": list(metadata.keys()),
     "total_vectors": total_vectors,
 }
 with open(OUTPUT_PROGRESS_FILE, 'w') as f:

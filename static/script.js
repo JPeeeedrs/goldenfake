@@ -336,10 +336,11 @@ function renderSources(list) {
 	updateSourcesCardVisibility();
 }
 
-function renderCorroborationNote(rawHist, adjHist, multiplier, corrobBlock) {
+function renderCorroborationNote(rawHist, adjHist, multiplier, ratio, corrobBlock) {
 	const note = el("histCorrNote");
 	if (!note) return;
 	const hasMultiplier = typeof multiplier === "number" && isFinite(multiplier);
+	const hasRatio = typeof ratio === "number" && isFinite(ratio);
 	const rawTxt =
 		typeof rawHist === "number" && isFinite(rawHist) ? fmt(rawHist) : "--";
 	const adjTxt =
@@ -372,7 +373,11 @@ function renderCorroborationNote(rawHist, adjHist, multiplier, corrobBlock) {
 		return;
 	}
 	const multTxt = fmtRatio(multiplier);
-	const baseText = `Corroboração FAISS: ${multTxt} (bruto ${rawTxt} → ajustado ${adjTxt}).`;
+	const ratioTxt = hasRatio ? fmtRatio(ratio) : null;
+	const descriptor = ratioTxt
+		? `sobreposição ${ratioTxt} • multiplicador ${multTxt}`
+		: `multiplicador ${multTxt}`;
+	const baseText = `Corroboração FAISS: ${descriptor} (bruto ${rawTxt} → ajustado ${adjTxt}).`;
 	const tooltipParts = [];
 	if (matchedEntities.length) {
 		tooltipParts.push(`Entidades encontradas: ${matchedEntities.join(", ")}`);
@@ -402,14 +407,17 @@ function renderEntityVerification(block) {
 	section.style.display = "block";
 	list.innerHTML = "";
 	if (summary) {
-		const avg =
-			typeof block?.media_score === "number"
-				? block.media_score.toFixed(2)
-				: "--";
+		let avgPct = null;
+		if (typeof block?.media_percent === "number") {
+			avgPct = block.media_percent.toFixed(1);
+		} else if (typeof block?.media_score === "number") {
+			avgPct = (block.media_score * 100).toFixed(1);
+		}
+		const avgText = avgPct != null ? `${avgPct}%` : "--";
 		const fortes = block?.fortes ?? 0;
 		const fracas = block?.fracas ?? 0;
 		const ausentes = block?.ausentes ?? 0;
-		summary.textContent = `Média: ${avg} • fortes: ${fortes} | fracas: ${fracas} | ausentes: ${ausentes}`;
+		summary.textContent = `Média: ${avgText} • fortes: ${fortes} | fracas: ${fracas} | ausentes: ${ausentes}`;
 	}
 	entities.forEach((item) => {
 		const row = document.createElement("div");
@@ -421,8 +429,12 @@ function renderEntityVerification(block) {
 		name.textContent = item.entidade || "(sem nome)";
 		const score = document.createElement("div");
 		score.className = "small";
-		const scoreVal =
-			typeof item.score === "number" ? item.score.toFixed(2) : "--";
+		let scoreVal = "--";
+		if (typeof item.percent === "number") {
+			scoreVal = `${item.percent.toFixed(1)}%`;
+		} else if (typeof item.score === "number") {
+			scoreVal = `${(item.score * 100).toFixed(1)}%`;
+		}
 		score.textContent = `Score: ${scoreVal}`;
 		info.appendChild(name);
 		info.appendChild(score);
@@ -437,7 +449,10 @@ function renderEntityVerification(block) {
 				.slice(0, 3)
 				.map((res) => res.publisher || res.provider || res.url || "fonte")
 				.join(" • ");
-			row.title = tooltip;
+			const tipParts = [];
+			if (scoreVal !== "--") tipParts.push(`Score ${scoreVal}`);
+			if (tooltip) tipParts.push(tooltip);
+			row.title = tipParts.join(" | ");
 		}
 		list.appendChild(row);
 	});
@@ -826,6 +841,7 @@ document.addEventListener("DOMContentLoaded", () => {
 					hRaw,
 					h,
 					json.historico?.corroboracao_multiplicador,
+					json.historico?.corroboracao_score,
 					json.historico?.corroboracao
 				);
 				const displayPayload = json.frontend_view || json;

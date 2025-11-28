@@ -10,6 +10,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, TextIO
+from sentence_transformers import SentenceTransformer
 
 
 @dataclass
@@ -18,8 +19,32 @@ class ChunkState:
     written: int = 0
 
 
-PARAGRAPH_SPLIT = re.compile(r"\n\s*\n")
-TOKEN_PATTERN = re.compile(r"\S+")
+def chunk_text_optimized(tokenizer, text: str, max_tokens: int = 512, overlap: int = 128) -> List[str]:
+    """
+    Implementação única, robusta e eficiente de chunking.
+    - Usa tokenizer nativo do modelo
+    - Fallback automático para texto completo
+    - Stride otimizado: max_tokens - overlap
+    """
+    # Tokeniza o texto (sem truncar ainda)
+    tokens = tokenizer.encode(text, truncation=False)
+
+    # Se couber tudo em um chunk, retorna direto
+    if len(tokens) <= max_tokens:
+        return [text]
+
+    stride = max(1, max_tokens - overlap)
+    chunks = []
+
+    # Janela deslizante
+    for start in range(0, len(tokens), stride):
+        window = tokens[start: start + max_tokens]
+        # Decodifica de volta para texto
+        chunk = tokenizer.decode(window, skip_special_tokens=True)
+        if chunk.strip():
+            chunks.append(chunk)
+
+    return chunks
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +64,24 @@ def parse_args() -> argparse.Namespace:
         help="Destination file for chunked articles in JSON Lines format",
     )
     parser.add_argument(
+        "--model-name",
+        type=str,
+        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        help="Model name to use for tokenization",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=512,
+        help="Max tokens per chunk",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=int,
+        default=128,
+        help="Overlap tokens between chunks",
+    )
+    parser.add_argument(
         "--progress-file",
         type=Path,
         help="Optional progress file used for incremental saving",
@@ -48,6 +91,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Resume from the last saved progress, if available",
     )
+    return parser.parse_args()
     parser.add_argument(
         "--save-interval",
         type=int,
@@ -132,7 +176,8 @@ def iter_articles(path: Path, fmt: str, skip: int) -> Iterator[dict]:
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, list):
-            raise TypeError("JSON input must be a list when not using JSON Lines format")
+            raise TypeError(
+                "JSON input must be a list when not using JSON Lines format")
         for idx, article in enumerate(payload):
             if idx < skip:
                 continue
@@ -147,7 +192,8 @@ def prepare_output_handle(path: Path, append: bool) -> TextIO:
 
 def split_paragraphs(text: str) -> List[str]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    paragraphs = [part.strip() for part in PARAGRAPH_SPLIT.split(normalized) if part.strip()]
+    paragraphs = [part.strip()
+                  for part in PARAGRAPH_SPLIT.split(normalized) if part.strip()]
     if not paragraphs and normalized.strip():
         paragraphs = [normalized.strip()]
     return paragraphs
@@ -183,7 +229,8 @@ def chunk_paragraph(paragraph: str, max_tokens: int, overlap: int, min_tokens: i
 def chunk_article_text(text: str, max_tokens: int, overlap: int, min_tokens: int) -> List[str]:
     chunks: List[str] = []
     for paragraph in split_paragraphs(text):
-        chunks.extend(chunk_paragraph(paragraph, max_tokens, overlap, min_tokens))
+        chunks.extend(chunk_paragraph(
+            paragraph, max_tokens, overlap, min_tokens))
     return chunks
 
 
@@ -199,14 +246,17 @@ def merge_state_with_progress(
     expected_output = str(args.output_path.resolve())
 
     if progress.get("articles_path") != expected_articles:
-        logging.warning("Progress file references a different articles file. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different articles file. Ignoring saved state.")
         return state, 0
     if progress.get("output_path") != expected_output:
-        logging.warning("Progress file references a different output path. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different output path. Ignoring saved state.")
         return state, 0
 
     if progress.get("max_tokens") != args.max_tokens or progress.get("overlap") != args.overlap:
-        logging.warning("Chunk configuration changed. Saved state will be ignored.")
+        logging.warning(
+            "Chunk configuration changed. Saved state will be ignored.")
         return state, 0
 
     state.processed = progress.get("processed", 0)
@@ -241,32 +291,38 @@ def persist_progress(
 def process_articles(args: argparse.Namespace) -> None:
     configure_logging(args.log_level)
 
-    if args.save_interval <= 0:
-        raise ValueError("save-interval must be greater than zero")
-    if args.max_tokens <= 0:
-        raise ValueError("max-tokens must be greater than zero")
+    if args.chunk_size <= 0:
+        raise ValueError("chunk-size must be greater than zero")
     if args.overlap < 0:
         raise ValueError("overlap must be zero or positive")
-    if args.min_chunk_tokens < 0:
-        raise ValueError("min-chunk-tokens must be zero or positive")
-    if args.overlap >= args.max_tokens:
-        raise ValueError("overlap must be smaller than max-tokens")
+    if args.overlap >= args.chunk_size:
+        raise ValueError("overlap must be smaller than chunk-size")
+
+    logging.info(f"Loading tokenizer: {args.model_name}")
+    # Carrega apenas o tokenizer para ser rápido
+    model = SentenceTransformer(args.model_name)
+    tokenizer = model.tokenizer
 
     fmt = detect_json_format(args.articles_path)
 
-    progress_path = args.progress_file or args.output_path.with_suffix(".progress.json")
+    progress_path = args.progress_file or args.output_path.with_suffix(
+        ".progress.json")
     if progress_path.exists() and not args.resume:
         progress_path.unlink()
 
     progress_payload = load_progress(progress_path) if args.resume else None
 
     state = ChunkState()
-    state, skip_count = merge_state_with_progress(state, progress_payload, args)
+    state, skip_count = merge_state_with_progress(
+        state, progress_payload, args)
 
     append_output = state.written > 0
-    output_handle = prepare_output_handle(args.output_path, append=append_output)
+    output_handle = prepare_output_handle(
+        args.output_path, append=append_output)
 
     articles_since_save = 0
+    save_interval = 100  # Hardcoded ou poderia vir de args
+
     try:
         for article in iter_articles(args.articles_path, fmt, skip_count):
             article_id = article.get("id") or article.get("page_id")
@@ -277,24 +333,30 @@ def process_articles(args: argparse.Namespace) -> None:
                 articles_since_save += 1
                 continue
 
-            chunks = chunk_article_text(text, args.max_tokens, args.overlap, args.min_chunk_tokens)
+            # Usa a nova função otimizada
+            chunks = chunk_text_optimized(
+                tokenizer, text, args.chunk_size, args.overlap)
+
             if chunks:
                 payload = {
                     "id": article_id,
                     "title": title,
                     "chunks": chunks,
                 }
-                output_handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                output_handle.write(json.dumps(
+                    payload, ensure_ascii=False) + "\n")
                 state.written += 1
             state.processed += 1
             articles_since_save += 1
 
-            if articles_since_save >= args.save_interval:
+            if articles_since_save >= save_interval:
                 persist_progress(progress_path, args, state)
-                logging.info("Progress saved: %d processed, %d chunked.", state.processed, state.written)
+                logging.info("Progress saved: %d processed, %d chunked.",
+                             state.processed, state.written)
                 articles_since_save = 0
 
-        logging.info("Chunking completed: %d processed, %d written.", state.processed, state.written)
+        logging.info("Chunking completed: %d processed, %d written.",
+                     state.processed, state.written)
 
     except KeyboardInterrupt:
         logging.warning("Interrupted by user. Saving progress before exiting.")

@@ -11,8 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional, TextIO
 from xml.etree.ElementTree import iterparse
+import sys
 
-from wikiextractor.extract import Extractor
+try:
+    from wikiextractor.extract import Extractor
+except ImportError:
+    print("ERRO CRÍTICO: A biblioteca 'wikiextractor' não foi encontrada.")
+    print("Por favor, instale-a executando: pip install wikiextractor")
+    sys.exit(1)
 
 
 @dataclass
@@ -113,7 +119,7 @@ def configure_logging(level: str) -> None:
 
 def extract_namespace(tag: str) -> str:
     if tag.startswith("{") and "}" in tag:
-        return tag[1 : tag.find("}")]
+        return tag[1: tag.find("}")]
     return ""
 
 
@@ -129,7 +135,8 @@ def iter_dump_articles(dump_path: Path) -> Iterator[tuple[str, str, str, str]]:
             raise RuntimeError("Dump appears to be empty") from exc
 
         if event != "start":
-            raise RuntimeError("Unexpected XML stream state: root element not found")
+            raise RuntimeError(
+                "Unexpected XML stream state: root element not found")
 
         namespace = extract_namespace(root.tag)
         ns = f"{{{namespace}}}" if namespace else ""
@@ -247,16 +254,19 @@ def merge_state_with_progress(state: ExtractionState, progress: Optional[dict], 
 
     expected_dump = str(args.dump_path.resolve())
     if progress.get("dump_path") != expected_dump:
-        logging.warning("Progress file references a different dump. Ignoring saved state.")
+        logging.warning(
+            "Progress file references a different dump. Ignoring saved state.")
         return state, 0
 
     if progress.get("articles_per_file") != args.articles_per_file:
-        logging.warning("Articles-per-file mismatch. Saved state will be ignored.")
+        logging.warning(
+            "Articles-per-file mismatch. Saved state will be ignored.")
         return state, 0
 
     state.processed_articles = progress.get("processed_articles", 0)
     state.output_file_index = progress.get("output_file_index", 0)
-    state.articles_in_current_file = progress.get("articles_in_current_file", 0)
+    state.articles_in_current_file = progress.get(
+        "articles_in_current_file", 0)
     state.last_page_id = progress.get("last_page_id")
 
     skip_count = state.processed_articles
@@ -289,10 +299,12 @@ def process_dump(args: argparse.Namespace) -> None:
     progress_data = load_progress(progress_path) if args.resume else None
 
     state = ExtractionState()
-    state, skip_remaining = merge_state_with_progress(state, progress_data, args)
+    state, skip_remaining = merge_state_with_progress(
+        state, progress_data, args)
 
     append_mode = state.articles_in_current_file > 0
-    output_path, output_handle = open_output_file(args.output_dir, state, args.output_format, append_mode)
+    output_path, output_handle = open_output_file(
+        args.output_dir, state, args.output_format, append_mode)
     logging.info("Writing output to %s", output_path)
 
     articles_since_save = 0
@@ -303,7 +315,8 @@ def process_dump(args: argparse.Namespace) -> None:
                 skip_remaining -= 1
                 continue
 
-            article = clean_article_text(page_id, revid, title, raw_text, args.url_base)
+            article = clean_article_text(
+                page_id, revid, title, raw_text, args.url_base)
             if not article.text:
                 continue
 
@@ -319,7 +332,8 @@ def process_dump(args: argparse.Namespace) -> None:
                 )
                 logging.info("Created new output file: %s", output_path)
 
-            write_article(output_handle, article, args.output_format, args.url_base)
+            write_article(output_handle, article,
+                          args.output_format, args.url_base)
             state.articles_in_current_file += 1
             state.processed_articles += 1
             state.last_page_id = article.page_id
@@ -344,7 +358,8 @@ def process_dump(args: argparse.Namespace) -> None:
                     state.output_file_index,
                 )
 
-        logging.info("Extraction completed: %d articles processed in total.", state.processed_articles)
+        logging.info(
+            "Extraction completed: %d articles processed in total.", state.processed_articles)
 
     except KeyboardInterrupt:
         logging.warning("Interrupted by user. Saving progress before exiting.")
