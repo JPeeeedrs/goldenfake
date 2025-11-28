@@ -236,8 +236,8 @@ def main():
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument("--use_style", action="store_true",
                         help="Adicionar features de estilo")
-    parser.add_argument("--style_weight", type=float, default=0.15,
-                        help="Peso das features de estilo (0.1-0.3 recomendado)")
+    parser.add_argument("--style_weight", type=float, default=0.05,
+                        help="Peso das features de estilo (0.05-0.1 recomendado)")
     parser.add_argument("--n_estimators", type=int, default=300,
                         help="Número de árvores no XGBoost")
     parser.add_argument("--max_depth", type=int, default=7,
@@ -357,17 +357,10 @@ def main():
         scale_pos_weight=1.0
     )
 
-    # Aplicar calibração sigmoid (Platt Scaling) - Melhor para jogar probabilidades para os extremos
-    logger.info("Aplicando calibração sigmoid (CV=5)...")
-    clf = CalibratedClassifierCV(
-        estimator=base_clf,
-        method="sigmoid",  # Mudança de 'isotonic' para 'sigmoid'
-        cv=5,
-        n_jobs=-1
-    )
-
-    # Treinar com pesos
-    logger.info("Ajustando modelo...")
+    # NÃO aplicar calibração - ela estava comprimindo muito as probabilidades
+    # Treinar diretamente com o XGBoost
+    logger.info("Ajustando modelo (sem calibração)...")
+    clf = base_clf
     clf.fit(X_train, y_train_final, sample_weight=sample_weights)
 
     # Avaliar
@@ -409,8 +402,8 @@ def main():
         "n_estimators": args.n_estimators,
         "max_depth": args.max_depth,
         "learning_rate": args.learning_rate,
-        "calibrated": True,
-        "calibration_method": "sigmoid"
+        "calibrated": False,
+        "calibration_method": "none"
     }
 
     with open(os.path.join(MODEL_DIR, "config.json"), "w", encoding="utf-8") as f:

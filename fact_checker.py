@@ -225,52 +225,100 @@ def historical_consistency_for_text(index, model: SentenceTransformer, text: str
                                     k: int = 8,
                                     max_tokens: int = _DEFAULT_MAX_TOKENS,
                                     overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
-                                    aggregate: str = "max") -> Tuple[float, List]:
+                                    aggregate: str = "max") -> Tuple[float, List, Dict]:
     """Calcula consistência histórica com FAISS usando chunking e agregação."""
+    debug_log = {
+        "chunks_total": 0,
+        "chunks_detail": [],
+        "scores_per_chunk": [],
+        "aggregation_method": aggregate,
+        "final_score_raw": 0.0,
+        "final_score_after_agg": 0.0,
+        "top_neighbors_summary": []
+    }
+
     chunks = chunk_text_optimized(model, text, max_tokens, overlap_tokens)
 
     if not chunks:
-        return 0.0, []
+        return 0.0, [], debug_log
 
+    debug_log["chunks_total"] = len(chunks)
     scores = []
     all_neighbors = []
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         q_emb = embed_query(model, chunk, normalize=True)
 
         if index.ntotal == 0:
-            return 0.0, []
+            return 0.0, [], debug_log
 
         D, I = index.search(q_emb, k)
         sims = np.clip(D[0], 0.0, 1.0)
         score = float(np.mean(sims)) * 100.0
 
         scores.append(score)
-        all_neighbors.append(list(zip(I[0].tolist(), sims.tolist())))
+        neighbors_list = list(zip(I[0].tolist(), sims.tolist()))
+        all_neighbors.append(neighbors_list)
+
+        # Log detalhado do chunk
+        chunk_detail = {
+            "chunk_id": i,
+            "chunk_text_preview": chunk[:100],
+            "score": score,
+            "top_3_neighbors": []
+        }
+
+        # Adicionar top 3 vizinhos com info
+        for j in range(min(3, len(I[0]))):
+            idx = int(I[0][j])
+            sim = float(sims[j])
+            chunk_detail["top_3_neighbors"].append({
+                "idx": idx,
+                "similarity": sim,
+                "label": "unknown"  # Será preenchido se metadata disponível
+            })
+
+        debug_log["chunks_detail"].append(chunk_detail)
+        debug_log["scores_per_chunk"].append(score)
 
     if not scores:
-        return 0.0, []
+        return 0.0, [], debug_log
 
     if aggregate == "mean":
         final_score = float(np.mean(scores))
-        # Retornar vizinhos do melhor chunk
         best_idx = int(np.argmax(scores))
-        return final_score, all_neighbors[best_idx]
+        debug_log["final_score_after_agg"] = final_score
+        debug_log["best_chunk_idx"] = best_idx
+        return final_score, all_neighbors[best_idx], debug_log
     else:  # max
         best_idx = int(np.argmax(scores))
-        return scores[best_idx], all_neighbors[best_idx]
+        final_score = scores[best_idx]
+        debug_log["final_score_after_agg"] = final_score
+        debug_log["best_chunk_idx"] = best_idx
+        return final_score, all_neighbors[best_idx], debug_log
 
 
 def bert_probability_true_for_text(clf, le, model: SentenceTransformer, cfg: Dict,
                                    text: str,
                                    max_tokens: int = _DEFAULT_MAX_TOKENS,
                                    overlap_tokens: int = _DEFAULT_OVERLAP_TOKENS,
-                                   aggregate: str = "mean") -> float:
+                                   aggregate: str = "mean") -> Tuple[float, Dict]:
     """Calcula probabilidade 'true' usando BERT com chunking."""
+    debug_log = {
+        "chunks_total": 0,
+        "chunks_detail": [],
+        "aggregation_method": aggregate,
+        "final_score_raw": 0.0,
+        "style_features_enabled": cfg.get("style_features", False),
+        "style_weight": cfg.get("style_weight", 0.0)
+    }
+
     chunks = chunk_text_optimized(model, text, max_tokens, overlap_tokens)
 
     if not chunks:
-        return 0.0
+        return 0.0, debug_log
+
+    debug_log["chunks_total"] = len(chunks)
 
     # Processar todos os chunks em batch
     embeddings = [embed_query_with_style(
@@ -283,15 +331,46 @@ def bert_probability_true_for_text(clf, le, model: SentenceTransformer, cfg: Dic
     # Identificar índice da classe 'true'
     try:
         idx_true = list(le.classes_).index("true")
+        idx_false = list(le.classes_).index("fake")
     except ValueError:
         idx_true = int(np.argmax(proba[0]))
+        idx_false = 1 - idx_true
 
     probs_true = proba[:, idx_true] * 100.0
+    probs_false = proba[:, idx_false] * 100.0
+
+    # Log detalhado de cada chunk
+    for i, chunk in enumerate(chunks):
+        chunk_detail = {
+            "chunk_id": i,
+            "chunk_text_preview": chunk[:100],
+            "prob_true": float(probs_true[i]),
+            "prob_false": float(probs_false[i])
+        }
+
+        # Se style features ativo, adicionar info
+        if cfg.get("style_features"):
+            style_feats = extract_style_features(chunk)
+            chunk_detail["style_features"] = {
+                "upper_ratio": float(style_feats[0]),
+                "allcaps_ratio": float(style_feats[1]),
+                "punct_ratio": float(style_feats[2]),
+                "exclam": float(style_feats[3]),
+                "quest": float(style_feats[4]),
+                "avg_word_len_norm": float(style_feats[5]),
+                "ttr": float(style_feats[6]),
+                "lex_density": float(style_feats[7])
+            }
+
+        debug_log["chunks_detail"].append(chunk_detail)
 
     if aggregate == "max":
-        return float(np.max(probs_true))
+        final_score = float(np.max(probs_true))
     else:  # mean
-        return float(np.mean(probs_true))
+        final_score = float(np.mean(probs_true))
+
+    debug_log["final_score_raw"] = final_score
+    return final_score, debug_log
 
 
 def blend_score_with_entities(base_score: float,
@@ -315,47 +394,104 @@ def blend_score_with_entities(base_score: float,
 
 
 def fuse_scores(hist_score: float | None, bert_score: float | None, fonte_score: float | None,
-                w_hist: float = 0.4, w_bert: float = 0.3, w_fontes: float = 0.3) -> float:
+                w_hist: float = 0.4, w_bert: float = 0.3, w_fontes: float = 0.3) -> Tuple[float, Dict]:
     """
     Fusão ponderada dinâmica. 
     Se um componente for None (erro/indisponível), seus pesos são redistribuídos.
     """
-    # Lista de tuplas: (score, peso_original)
+    debug_log = {
+        "hist_score": hist_score,
+        "bert_score": bert_score,
+        "fonte_score": fonte_score,
+        "w_hist_original": w_hist,
+        "w_bert_original": w_bert,
+        "w_fontes_original": w_fontes,
+        "w_hist_normalized": 0.0,
+        "w_bert_normalized": 0.0,
+        "w_fontes_normalized": 0.0,
+        "hist_contribution": 0.0,
+        "bert_contribution": 0.0,
+        "fontes_contribution": 0.0,
+        "calculation_formula": "",
+        "final_score": 0.0,
+        "components_used": [],
+        "components_failed": []
+    }
+
+    # Lista de tuplas: (score, peso_original, nome)
     components = [
-        (hist_score, w_hist),
-        (bert_score, w_bert),
-        (fonte_score, w_fontes)
+        (hist_score, w_hist, "historico"),
+        (bert_score, w_bert, "bert"),
+        (fonte_score, w_fontes, "fontes")
     ]
 
     valid_scores = []
     valid_weights = []
+    valid_names = []
 
-    for score, weight in components:
+    for score, weight, name in components:
         # Só aceita se não for None e for maior ou igual a 0
         if score is not None and score >= 0:
             valid_scores.append(score)
             valid_weights.append(weight)
+            valid_names.append(name)
+            debug_log["components_used"].append(name)
+        else:
+            debug_log["components_failed"].append(name)
 
     # Se todos falharam (lista vazia), retorna Neutro (50.0)
     if not valid_scores:
-        return 50.0
+        debug_log["final_score"] = 50.0
+        debug_log[
+            "calculation_formula"] = "Todos os componentes falharam - retornando neutro (50.0)"
+        return 50.0, debug_log
 
     # Converter para numpy para cálculo vetorial
     scores_np = np.array(valid_scores, dtype=np.float32)
     weights_np = np.array(valid_weights, dtype=np.float32)
 
     # Renormalizar os pesos para que a soma seja 1.0
-    # Ex: Se sobrar só w_bert(0.3) e w_fontes(0.3), a soma é 0.6.
-    # Nós dividimos cada um por 0.6 para virarem 0.5 e 0.5.
     weight_sum = weights_np.sum()
 
     if weight_sum > 0:
         weights_np = weights_np / weight_sum
     else:
         # Caso de segurança matemático extremo
-        return float(np.mean(scores_np))
+        final = float(np.mean(scores_np))
+        debug_log["final_score"] = final
+        debug_log["calculation_formula"] = f"Média simples: {final:.2f}"
+        return final, debug_log
 
-    return float(np.dot(weights_np, scores_np))
+    # Salvar pesos normalizados
+    weight_mapping = {
+        "historico": "w_hist_normalized",
+        "bert": "w_bert_normalized",
+        "fontes": "w_fontes_normalized"
+    }
+    for i, name in enumerate(valid_names):
+        debug_log[weight_mapping[name]] = float(weights_np[i])
+
+    # Calcular contribuições individuais
+    contributions = weights_np * scores_np
+    contrib_mapping = {
+        "historico": "hist_contribution",
+        "bert": "bert_contribution",
+        "fontes": "fontes_contribution"
+    }
+    for i, name in enumerate(valid_names):
+        debug_log[contrib_mapping[name]] = float(contributions[i])
+
+    # Fórmula de cálculo
+    formula_parts = []
+    for i, name in enumerate(valid_names):
+        formula_parts.append(f"({weights_np[i]:.3f} × {scores_np[i]:.2f})")
+    debug_log["calculation_formula"] = " + ".join(
+        formula_parts) + f" = {float(np.dot(weights_np, scores_np)):.2f}"
+
+    final_score = float(np.dot(weights_np, scores_np))
+    debug_log["final_score"] = final_score
+
+    return final_score, debug_log
 
 
 def classify_text(final_score: float) -> Tuple[str, float]:

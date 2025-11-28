@@ -4,11 +4,11 @@
   "debias": "mask",
   "style_features": true,
   "style_feature_count": 8,
-  "style_weight": 0.15,
+  "style_weight": 0.05,
   "max_seq_length": 512,
   "n_estimators": 300,
   "max_depth": 7,
   "learning_rate": 0.05,
-  "calibrated": true,
-  "calibration_method": "sigmoid"
+  "calibrated": false,
+  "calibration_method": "none"
 }

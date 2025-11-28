@@ -1344,10 +1344,22 @@ def evaluate_claim_against_results(claim: str, results: List[Dict[str, Any]], sb
     return avg_top10_pct, top
 
 
-def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple[float, List[Dict[str, Any]], Dict[str, Any]]:
+def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple[float, List[Dict[str, Any]], Dict[str, Any], Dict]:
+    debug_log = {
+        "claims": [],
+        "apis_used": [],
+        "entities": None,
+        "total_claims": 0,
+        "final_score": 0.0
+    }
+
     claims = extract_claims(text)
     if not claims:
         claims = [text]
+
+    debug_log["total_claims"] = len(claims)
+    debug_log["claims"] = [
+        {"text": c, "score": 0.0, "percent": 0.0} for c in claims]
 
     # Ler chaves somente do .env local
     google_key = ENV.get("FACT_CHECK_API_KEY") or ENV.get(
@@ -1361,9 +1373,30 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
     details_all: List[Dict[str, Any]] = []
     claim_percentages: List[float] = []
 
-    for c in claims:
+    # Track APIs
+    api_tracker = {
+        "Google Fact Check": {"success": bool(google_key), "results_count": 0, "enabled": bool(google_key)},
+        "NewsAPI": {"success": bool(newsapi_key), "results_count": 0, "enabled": bool(newsapi_key)},
+        "SerpAPI": {"success": bool(serpapi_key), "results_count": 0, "enabled": bool(serpapi_key)},
+        "Bing Search": {"success": bool(bing_key), "results_count": 0, "enabled": bool(bing_key)},
+        "Gemini AI": {"success": bool(gemini_key), "results_count": 0, "enabled": bool(gemini_key)}
+    }
+
+    for i, c in enumerate(claims):
         _level1_evidences_raw, news_general_context = _query_fact_checks_for_text(
             c, google_key, newsapi_key)
+
+        # Track Google Fact Check
+        if google_key and _level1_evidences_raw:
+            api_tracker["Google Fact Check"]["results_count"] += len(
+                [e for e in _level1_evidences_raw if e.get("provider") == "google_factcheck"])
+
+        # Track NewsAPI
+        if newsapi_key:
+            newsapi_results = len([e for e in _level1_evidences_raw if e.get(
+                "provider") == "newsapi"]) + len(news_general_context)
+            api_tracker["NewsAPI"]["results_count"] += newsapi_results
+
         level1_evidences = _filter_fact_checks_by_similarity(
             c, _level1_evidences_raw, sbert)
         gemini_block: Dict[str, Any] | None = None
@@ -1382,15 +1415,18 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
             serp_hits = query_serpapi(c, serpapi_key)
             if serp_hits:
                 context_hits.extend(serp_hits)
+                api_tracker["SerpAPI"]["results_count"] += len(serp_hits)
             bing_hits = query_bing(c, bing_key)
             if bing_hits:
                 context_hits.extend(bing_hits)
+                api_tracker["Bing Search"]["results_count"] += len(bing_hits)
             nivel2_total = len(context_hits)
             results = list(context_hits)
             if gemini_key:
                 gemini_res = query_gemini_factcheck(
                     c, gemini_key, context=context_hits)
                 if gemini_res and isinstance(gemini_res.get("score"), (int, float)):
+                    api_tracker["Gemini AI"]["results_count"] += 1
                     percent_true = max(
                         0.0, min(100.0, float(gemini_res["score"])))
                     verdict_label = _gemini_verdict_from_score(percent_true)
@@ -1411,6 +1447,8 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
                         "context_hits": context_summary,
                     }
                     results.append(gemini_block)
+                else:
+                    api_tracker["Gemini AI"]["success"] = False
 
         score_c, top = evaluate_claim_against_results(c, results, sbert)
         claim_percent = _claim_percent_from_fact_checks(level1_evidences)
@@ -1420,6 +1458,12 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
             claim_percent = 50.0
         claim_percent = max(0.0, min(100.0, float(claim_percent)))
         claim_percentages.append(claim_percent)
+
+        # Update debug log for this claim
+        debug_log["claims"][i]["score"] = round(score_c, 1)
+        debug_log["claims"][i]["percent"] = round(claim_percent, 1)
+        debug_log["claims"][i]["nivel"] = nivel_utilizado
+
         details_all.append({
             "afirmacao": c,
             "nivel": nivel_utilizado,
@@ -1440,12 +1484,37 @@ def verify_with_external_sources(text: str, sbert: SentenceTransformer) -> Tuple
 
     try:
         entity_block = verify_entities_with_serpapi(text, serpapi_key)
+        if entity_block:
+            entity_items = []
+            for ent in entity_block.get("entities", []):
+                entity_items.append({
+                    "name": ent.get("entity"),
+                    "status": ent.get("status"),
+                    "score": ent.get("score_percent", 0.0)
+                })
+            debug_log["entities"] = {
+                "items": entity_items,
+                "media_percent": entity_block.get("media_percent", 0.0),
+                "total": len(entity_items)
+            }
     except Exception:
         logger.exception("Erro ao verificar entidades via SerpAPI")
         entity_block = {}
+
     if entity_block:
         avg_pct = entity_block.get("media_percent")
         if isinstance(avg_pct, (int, float)):
             fonte_score = min(fonte_score, float(avg_pct))
 
-    return fonte_score, details_all, entity_block
+    debug_log["final_score"] = fonte_score
+
+    # Compile API tracking
+    for api_name, api_info in api_tracker.items():
+        debug_log["apis_used"].append({
+            "name": api_name,
+            "success": api_info["success"] and api_info["results_count"] > 0,
+            "results_count": api_info["results_count"],
+            "enabled": api_info["enabled"]
+        })
+
+    return fonte_score, details_all, entity_block, debug_log

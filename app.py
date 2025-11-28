@@ -82,9 +82,9 @@ except Exception as e:
 
 # Defaults
 DEFAULTS = {
-    "k": 20,
-    "w_hist": 0.4,
-    "w_bert": 0.3,
+    "k": 5,  # Reduzido de 20 para 5 - menos ruído com vizinhos unknown
+    "w_hist": 0.2,  # Reduzido de 0.4 - FAISS tem muitos vizinhos sem labels
+    "w_bert": 0.5,  # Aumentado de 0.3 - é o componente mais confiável
     "w_fontes": 0.3,
     "entity_bert_weight": ENTITY_BERT_WEIGHT,
     "max_tokens": 512,
@@ -473,16 +473,25 @@ def analyze_text_payload(text, k, w_hist, w_bert, w_fontes,
     if not text:
         return {"error": "texto vazio"}, 400
 
+    # Estrutura para acumular logs de diagnóstico
+    debug_logs = {
+        "historico": {},
+        "bert": {},
+        "fontes": {},
+        "fusao": {}
+    }
+
     wiki_limit = _clamp_wiki_limit(k, wiki_titles)
 
     # Consistência histórica (FAISS)
-    hist_score, neighbors = historical_consistency_for_text(
+    hist_score, neighbors, debug_hist = historical_consistency_for_text(
         INDEX, SBERT, text,
         k=k,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         aggregate=hist_agg
     )
+    debug_logs["historico"] = debug_hist
 
     # Corroboração FAISS
     faiss_corroboration = faiss_claim_corroboration(neighbors, METADATA, text)
@@ -501,38 +510,58 @@ def analyze_text_payload(text, k, w_hist, w_bert, w_fontes,
                 hist_score = hist_score * multiplier
                 corroboration_multiplier = multiplier
                 corroboration_score = raw_ratio
+                # Adicionar info de corroboração ao debug
+                debug_logs["historico"]["corroboration_applied"] = True
+                debug_logs["historico"]["corroboration_multiplier"] = multiplier
+                debug_logs["historico"]["score_before_corroboration"] = hist_score_raw
+                debug_logs["historico"]["score_after_corroboration"] = hist_score
             except (TypeError, ValueError):
                 pass
 
     # BERT
-    bert_score_true_raw = bert_probability_true_for_text(
+    bert_score_true_raw, debug_bert = bert_probability_true_for_text(
         CLF, LE, SBERT, CCFG, text,
         max_tokens=max_tokens,
         overlap_tokens=overlap_tokens,
         aggregate=bert_agg
     )
+    debug_logs["bert"] = debug_bert
 
     bert_score_true = bert_score_true_raw
     bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
 
     # Fontes externas
-    fonte_score, fonte_details, entity_block = verify_with_external_sources(
+    fonte_score, fonte_details, entity_block, debug_fontes = verify_with_external_sources(
         text, SBERT)
+    debug_logs["fontes"] = debug_fontes
 
     entity_avg = None
-    if entity_block:
-        bert_score_true, entity_avg = blend_score_with_entities(
-            bert_score_true_raw, entity_block, entity_bert_weight
-        )
-        bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
+    # CORREÇÃO: Só aplicar blend se entity_block existe E tem score > 0
+    if entity_block and entity_block.get("total", 0) > 0:
+        entity_avg = entity_block.get("media_percent")
+        # Não aplicar blend se entity_avg for None ou 0 (todas as APIs falharam)
+        if entity_avg is not None and entity_avg > 0:
+            bert_score_true, entity_avg = blend_score_with_entities(
+                bert_score_true_raw, entity_block, entity_bert_weight
+            )
+            bert_label = "provavelmente verdadeiro" if bert_score_true >= 50.0 else "provavelmente falso"
+            # Adicionar info de blend ao debug
+            debug_logs["bert"]["entity_blend_applied"] = True
+            debug_logs["bert"]["score_before_blend"] = bert_score_true_raw
+            debug_logs["bert"]["score_after_blend"] = bert_score_true
+            debug_logs["bert"]["entity_avg_percent"] = entity_avg
+        else:
+            debug_logs["bert"]["entity_blend_applied"] = False
+            debug_logs["bert"]["blend_skipped_reason"] = "Entity score is 0% (all APIs failed)"
 
     fontes_individuais = _flatten_external_evidence(fonte_details)
 
     # Score final
-    final_score = fuse_scores(
+    final_score, debug_fusao = fuse_scores(
         hist_score, bert_score_true, fonte_score,
         w_hist, w_bert, w_fontes
     )
+    debug_logs["fusao"] = debug_fusao
 
     final_label, _ = classify_text(final_score)
 
@@ -591,6 +620,7 @@ def analyze_text_payload(text, k, w_hist, w_bert, w_fontes,
             "max_tokens": max_tokens,
             "overlap_tokens": overlap_tokens,
         },
+        "debug": debug_logs  # ADICIONAR LOGS DE DIAGNÓSTICO
     }
 
     # Wikipedia sources

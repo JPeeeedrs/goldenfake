@@ -362,13 +362,15 @@ function renderCorroborationNote(rawHist, adjHist, multiplier, ratio, corrobBloc
 		: [];
 	if (!hasMultiplier) {
 		if (!corrobBlock || queryEntities.length === 0) {
-			note.textContent =
-				"Corroboração FAISS: não aplicada (nenhuma entidade nomeada encontrada).";
+			// CORREÇÃO: Esconder completamente a nota quando não há entidades
+			note.textContent = "";
+			note.style.display = "none";
 			note.title = "";
 			return;
 		}
 		note.textContent =
 			"Corroboração FAISS indisponível (falha ao extrair texto do artigo).";
+		note.style.display = "none"; // Esconder também quando falhou
 		note.title = "";
 		return;
 	}
@@ -387,6 +389,7 @@ function renderCorroborationNote(rawHist, adjHist, multiplier, ratio, corrobBloc
 		tooltipParts.push(`Ausentes: ${miss}`);
 	}
 	note.textContent = baseText;
+	note.style.display = "block"; // Garantir que está visível quando tem dados
 	note.title = tooltipParts.join(" | ");
 }
 
@@ -755,6 +758,307 @@ function updateSourcesCardVisibility() {
 		hasSourceList || hasWikiList || hasEntityList ? "block" : "none";
 }
 
+function renderDebugLogs(debugData) {
+	const debugBox = el("debugBox");
+	const debugContent = el("debugContent");
+	const showDebugBtn = el("showDebug");
+
+	if (!debugData || !debugBox || !debugContent) return;
+
+	showDebugBtn.disabled = false;
+
+	// Renderizar tab de Histórico
+	const histHtml = `
+    <div class="debug-panel" id="debug-hist">
+      <h3>📊 Análise do FAISS</h3>
+      <div class="debug-summary">
+        <p><strong>Total de chunks:</strong> ${debugData.historico.chunks_total || 0}</p>
+        <p><strong>Método de agregação:</strong> ${debugData.historico.aggregation_method || "N/A"}</p>
+        <p><strong>Score final (após agg):</strong> <span class="highlight">${(debugData.historico.final_score_after_agg || 0).toFixed(2)}%</span></p>
+        ${
+					debugData.historico.corroboration_applied
+						? `
+          <div class="notice-debug">
+            <strong>⚠️ Corroboração Aplicada:</strong><br>
+            Score antes: ${(debugData.historico.score_before_corroboration || 0).toFixed(2)}%<br>
+            Multiplicador: ${(debugData.historico.corroboration_multiplier || 0).toFixed(3)}<br>
+            Score depois: ${(debugData.historico.score_after_corroboration || 0).toFixed(2)}%
+          </div>
+        `
+						: ""
+				}
+      </div>
+      
+      <h4>Detalhes por Chunk:</h4>
+      <div class="chunks-grid">
+        ${(debugData.historico.chunks_detail || [])
+					.map(
+						(chunk, i) => `
+          <div class="chunk-card">
+            <strong>Chunk ${i + 1}</strong>
+            <p class="preview">"${chunk.chunk_text_preview}..."</p>
+            <p class="score">Score: ${chunk.score.toFixed(2)}%</p>
+            
+            <details>
+              <summary>Top 3 Vizinhos Mais Similares</summary>
+              <ul class="neighbor-list">
+                ${chunk.top_3_neighbors
+									.map(
+										(n) => `
+                  <li>
+                    <span class="similarity">${(n.similarity * 100).toFixed(1)}%</span>
+                    <span class="label-badge label-${n.label}">${n.label}</span>
+                    <span class="idx-info">ID: ${n.idx}</span>
+                  </li>
+                `
+									)
+									.join("")}
+              </ul>
+            </details>
+          </div>
+        `
+					)
+					.join("")}
+      </div>
+    </div>
+  `;
+
+	// Renderizar tab de BERT
+	const bertHtml = `
+    <div class="debug-panel" id="debug-bert" style="display: none;">
+      <h3>🤖 Análise do XGBoost+BERT</h3>
+      <div class="debug-summary">
+        <p><strong>Total de chunks:</strong> ${debugData.bert.chunks_total || 0}</p>
+        <p><strong>Método de agregação:</strong> ${debugData.bert.aggregation_method || "N/A"}</p>
+        <p><strong>Score final (raw):</strong> <span class="highlight">${(debugData.bert.final_score_raw || 0).toFixed(2)}%</span></p>
+        <p><strong>Style features:</strong> ${debugData.bert.style_features_enabled ? `✅ Ativado (peso: ${debugData.bert.style_weight})` : "❌ Desativado"}</p>
+        ${
+					debugData.bert.entity_blend_applied
+						? `
+          <div class="notice-debug">
+            <strong>⚠️ Blend com Entidades Aplicado:</strong><br>
+            Score antes: ${(debugData.bert.score_before_blend || 0).toFixed(2)}%<br>
+            Média entidades: ${(debugData.bert.entity_avg_percent || 0).toFixed(2)}%<br>
+            Score depois: ${(debugData.bert.score_after_blend || 0).toFixed(2)}%
+          </div>
+        `
+						: ""
+				}
+      </div>
+      
+      <h4>Detalhes por Chunk:</h4>
+      <div class="chunks-grid">
+        ${(debugData.bert.chunks_detail || [])
+					.map(
+						(chunk, i) => `
+          <div class="chunk-card">
+            <strong>Chunk ${i + 1}</strong>
+            <p class="preview">"${chunk.chunk_text_preview}..."</p>
+            <div class="prob-display">
+              <div class="prob-true">
+                <span class="prob-label">TRUE:</span>
+                <span class="prob-value">${chunk.prob_true.toFixed(2)}%</span>
+              </div>
+              <div class="prob-false">
+                <span class="prob-label">FALSE:</span>
+                <span class="prob-value">${chunk.prob_false.toFixed(2)}%</span>
+              </div>
+            </div>
+            
+            ${
+							chunk.style_features
+								? `
+              <details>
+                <summary>Features de Estilo</summary>
+                <ul class="style-features-list">
+                  <li>Upper ratio: <span class="feat-val">${chunk.style_features.upper_ratio.toFixed(3)}</span></li>
+                  <li>Allcaps ratio: <span class="feat-val">${chunk.style_features.allcaps_ratio.toFixed(3)}</span></li>
+                  <li>Pontuação: <span class="feat-val">${chunk.style_features.punct_ratio.toFixed(3)}</span></li>
+                  <li>Exclamações: <span class="feat-val">${chunk.style_features.exclam.toFixed(3)}</span></li>
+                  <li>Interrogações: <span class="feat-val">${chunk.style_features.quest.toFixed(3)}</span></li>
+                  <li>TTR: <span class="feat-val">${chunk.style_features.ttr.toFixed(3)}</span></li>
+                  <li><strong>Densidade léxico sensacional:</strong> <span class="feat-val highlight">${chunk.style_features.lex_density.toFixed(3)}</span></li>
+                </ul>
+              </details>
+            `
+								: ""
+						}
+          </div>
+        `
+					)
+					.join("")}
+      </div>
+    </div>
+  `;
+
+	// Renderizar tab de Fontes
+	const fontesHtml = `
+    <div class="debug-panel" id="debug-fontes" style="display: none;">
+      <h3>🌐 Análise de Fontes Externas</h3>
+      <div class="debug-summary">
+        <p><strong>Total de claims extraídas:</strong> ${debugData.fontes.total_claims || 0}</p>
+        <p><strong>Score final de fontes:</strong> <span class="highlight">${(debugData.fontes.final_score || 0).toFixed(2)}%</span></p>
+      </div>
+      
+      <h4>Claims Extraídas e Analisadas:</h4>
+      <div class="claims-list">
+        ${(debugData.fontes.claims || [])
+					.map(
+						(c, i) => `
+          <div class="claim-card">
+            <strong>Claim ${i + 1}</strong>
+            <p class="claim-text">"${c.text}"</p>
+            <div class="claim-scores">
+              <span>Score: ${(c.score || 0).toFixed(1)}%</span>
+              <span>Percent: ${(c.percent || 0).toFixed(1)}%</span>
+              <span class="nivel-badge nivel-${c.nivel || "nivel2"}">${c.nivel || "N/A"}</span>
+            </div>
+          </div>
+        `
+					)
+					.join("")}
+      </div>
+      
+      <h4>APIs Consultadas:</h4>
+      <div class="apis-grid">
+        ${(debugData.fontes.apis_used || [])
+					.map(
+						(api) => `
+          <div class="api-card ${api.success ? "api-success" : "api-failed"} ${!api.enabled ? "api-disabled" : ""}">
+            <div class="api-name">${api.name}</div>
+            <div class="api-status">
+              ${api.enabled ? (api.success ? "✅ Sucesso" : "❌ Falhou") : "🔒 Desabilitado"}
+            </div>
+            <div class="api-results">${api.results_count} resultados</div>
+          </div>
+        `
+					)
+					.join("")}
+      </div>
+      
+      ${
+				debugData.fontes.entities && debugData.fontes.entities.items
+					? `
+        <h4>Entidades Verificadas:</h4>
+        <div class="entities-grid">
+          ${debugData.fontes.entities.items
+						.map(
+							(ent) => `
+            <div class="entity-card entity-status-${ent.status}">
+              <strong>${ent.name}</strong>
+              <span class="entity-badge entity-${ent.status}">${ent.status}</span>
+              <span class="entity-score">${(ent.score || 0).toFixed(1)}%</span>
+            </div>
+          `
+						)
+						.join("")}
+        </div>
+        <p class="entities-summary">Média das entidades: <strong>${(debugData.fontes.entities.media_percent || 0).toFixed(1)}%</strong> (${debugData.fontes.entities.total || 0} entidades)</p>
+      `
+					: "<p class='info-msg'>Nenhuma entidade verificada.</p>"
+			}
+    </div>
+  `;
+
+	// Renderizar tab de Fusão
+	const fusaoHtml = `
+    <div class="debug-panel" id="debug-fusao" style="display: none;">
+      <h3>⚖️ Fusão dos Scores</h3>
+      
+      <div class="fusion-overview">
+        <p><strong>Componentes usados:</strong> ${(debugData.fusao.components_used || []).join(", ") || "Nenhum"}</p>
+        ${
+					debugData.fusao.components_failed &&
+					debugData.fusao.components_failed.length > 0
+						? `<p class="warning"><strong>⚠️ Componentes falharam:</strong> ${debugData.fusao.components_failed.join(", ")}</p>`
+						: ""
+				}
+      </div>
+      
+      <table class="fusion-table">
+        <thead>
+          <tr>
+            <th>Componente</th>
+            <th>Score</th>
+            <th>Peso Original</th>
+            <th>Peso Normalizado</th>
+            <th>Contribuição</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>📊 Histórico</td>
+            <td>${debugData.fusao.hist_score !== null && debugData.fusao.hist_score !== undefined ? debugData.fusao.hist_score.toFixed(2) + "%" : "N/A"}</td>
+            <td>${debugData.fusao.w_hist_original.toFixed(2)}</td>
+            <td>${debugData.fusao.w_hist_normalized.toFixed(3)}</td>
+            <td class="contribution">${(debugData.fusao.hist_contribution || 0).toFixed(2)}%</td>
+          </tr>
+          <tr>
+            <td>🤖 BERT</td>
+            <td>${debugData.fusao.bert_score !== null && debugData.fusao.bert_score !== undefined ? debugData.fusao.bert_score.toFixed(2) + "%" : "N/A"}</td>
+            <td>${debugData.fusao.w_bert_original.toFixed(2)}</td>
+            <td>${debugData.fusao.w_bert_normalized.toFixed(3)}</td>
+            <td class="contribution">${(debugData.fusao.bert_contribution || 0).toFixed(2)}%</td>
+          </tr>
+          <tr>
+            <td>🌐 Fontes</td>
+            <td>${debugData.fusao.fonte_score !== null && debugData.fusao.fonte_score !== undefined ? debugData.fusao.fonte_score.toFixed(2) + "%" : "N/A"}</td>
+            <td>${debugData.fusao.w_fontes_original.toFixed(2)}</td>
+            <td>${debugData.fusao.w_fontes_normalized.toFixed(3)}</td>
+            <td class="contribution">${(debugData.fusao.fontes_contribution || 0).toFixed(2)}%</td>
+          </tr>
+        </tbody>
+      </table>
+      
+      <div class="final-calc">
+        <h4>Cálculo Final:</h4>
+        <code>${debugData.fusao.calculation_formula || "N/A"}</code>
+      </div>
+      
+      <div class="final-score-display">
+        <h4>Score Final:</h4>
+        <div class="score-big">${(debugData.fusao.final_score || 0).toFixed(2)}%</div>
+      </div>
+    </div>
+  `;
+
+	debugContent.innerHTML = histHtml + bertHtml + fontesHtml + fusaoHtml;
+
+	// Adicionar event listeners para tabs
+	document.querySelectorAll(".debug-tab").forEach((tab) => {
+		tab.addEventListener("click", () => {
+			// Remover active de todas
+			document.querySelectorAll(".debug-tab").forEach((t) => t.classList.remove("active"));
+			document.querySelectorAll(".debug-panel").forEach((p) => (p.style.display = "none"));
+
+			// Ativar a clicada
+			tab.classList.add("active");
+			const targetTab = tab.getAttribute("data-tab");
+			el(`debug-${targetTab}`).style.display = "block";
+		});
+	});
+}
+
+function toggleDebugView(show) {
+	const debugBox = el("debugBox");
+	const showDebugBtn = el("showDebug");
+	const toggleDebugBtn = el("toggleDebug");
+
+	if (!debugBox) return;
+
+	if (show === undefined) {
+		show = debugBox.style.display === "none";
+	}
+
+	debugBox.style.display = show ? "block" : "none";
+	if (showDebugBtn) {
+		showDebugBtn.textContent = show ? "Ocultar diagnóstico" : "Mostrar diagnóstico";
+	}
+	if (toggleDebugBtn) {
+		toggleDebugBtn.textContent = show ? "Ocultar Diagnóstico" : "Mostrar Diagnóstico";
+	}
+}
+
 document.addEventListener("DOMContentLoaded", () => {
 	applyDefaultValues();
 	const advBtn = el("toggleAdvanced");
@@ -777,6 +1081,22 @@ document.addEventListener("DOMContentLoaded", () => {
 			toggleDetails(false);
 		}
 	};
+	
+	// Event listener para botão de diagnóstico
+	const showDebugBtn = el("showDebug");
+	if (showDebugBtn) {
+		showDebugBtn.addEventListener("click", () => {
+			toggleDebugView();
+		});
+	}
+	
+	const toggleDebugBtn = el("toggleDebug");
+	if (toggleDebugBtn) {
+		toggleDebugBtn.addEventListener("click", () => {
+			toggleDebugView();
+		});
+	}
+	
 	el("closeRaw").onclick = () => toggleDetails(false);
 	const copyBtn = el("copyRaw");
 	if (copyBtn) {
@@ -862,6 +1182,11 @@ document.addEventListener("DOMContentLoaded", () => {
 				if (copyBtn) {
 					copyBtn.disabled = false;
 					copyBtn.textContent = "Copiar JSON";
+				}
+				
+				// Renderizar logs de diagnóstico
+				if (json.debug) {
+					renderDebugLogs(json.debug);
 				}
 			}
 		} catch (e) {
