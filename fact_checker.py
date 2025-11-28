@@ -50,11 +50,26 @@ if not all(os.path.isfile(p) for p in [CLS_PATH, LE_PATH, CLS_CONFIG_PATH]):
             CLS_CONFIG_PATH = _alt_cfg
             STYLE_SCALER_PATH = os.path.join(MODEL_DIR, "style_scaler.joblib")
 
-# Features de estilo
+# Features de estilo - Léxico sensacionalista expandido (conforme sugestão Gemini)
 SENSATIONAL_LEXICON = [
-    "urgente", "chocante", "escândalo", "bomba", "imperdível",
-    "revelado", "exclusivo", "alerta", "incrível", "verdadeiro?",
-    "mentira", "fraude", "golpe", "boato", "polêmico", "assustador"
+    # Urgência/Atenção
+    "urgente", "chocante", "escândalo", "bomba", "imperdível", "alerta",
+    "grave", "atenção", "compartilhem", "divulguem", "viral",
+
+    # Teoria da Conspiração/Segredo
+    "revelado", "escondido", "censurado", "mídia não mostra", "ninguém fala",
+    "verdade oculta", "plano secreto", "bastidores", "farsa",
+
+    # Certeza Absoluta (Fake News odeia dúvida)
+    "comprovado", "sem dúvida", "absoluta verdade", "confirmado", "fato",
+
+    # Emoção Negativa/Ataque
+    "vergonha", "absurdo", "criminoso", "traição", "covardia", "destruição",
+    "ameaça", "perigo",
+
+    # Termos originais mantidos
+    "exclusivo", "incrível", "verdadeiro?", "mentira", "fraude", "golpe",
+    "boato", "polêmico", "assustador"
 ]
 PUNCT_SET = set("!?")
 

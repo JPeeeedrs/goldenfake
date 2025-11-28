@@ -17,18 +17,20 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Tentar carregar spaCy (opcional)
+# Carregar spaCy (conforme instalação: python -m spacy download pt_core_news_sm)
 try:
     import spacy
     try:
         _NLP = spacy.load("pt_core_news_sm")
-    except Exception:
+        logger.info("✓ spaCy pt_core_news_sm carregado com sucesso!")
+    except Exception as e:
         _NLP = None
-        logger.warning("Modelo spaCy pt_core_news_sm não disponível")
-except Exception:
+        logger.warning(
+            f"⚠ Modelo spaCy pt_core_news_sm não disponível ({e}). Usando fallback regex.")
+except Exception as e:
     spacy = None
     _NLP = None
-    logger.warning("spaCy não instalado")
+    logger.warning(f"⚠ spaCy não instalado ({e}). Usando fallback regex.")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATASET_PATH = os.path.join(BASE_DIR, "dataset_full_texts.json")
@@ -37,11 +39,26 @@ EMBED_MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
 os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Léxico sensacionalista otimizado
+# Léxico sensacionalista expandido (conforme sugestão Gemini)
 SENSATIONAL_LEXICON = [
-    "urgente", "chocante", "escândalo", "bomba", "imperdível",
-    "revelado", "exclusivo", "alerta", "incrível", "verdadeiro?",
-    "mentira", "fraude", "golpe", "boato", "polêmico", "assustador"
+    # Urgência/Atenção
+    "urgente", "chocante", "escândalo", "bomba", "imperdível", "alerta",
+    "grave", "atenção", "compartilhem", "divulguem", "viral",
+
+    # Teoria da Conspiração/Segredo
+    "revelado", "escondido", "censurado", "mídia não mostra", "ninguém fala",
+    "verdade oculta", "plano secreto", "bastidores", "farsa",
+
+    # Certeza Absoluta (Fake News odeia dúvida)
+    "comprovado", "sem dúvida", "absoluta verdade", "confirmado", "fato",
+
+    # Emoção Negativa/Ataque
+    "vergonha", "absurdo", "criminoso", "traição", "covardia", "destruição",
+    "ameaça", "perigo",
+
+    # Termos originais mantidos
+    "exclusivo", "incrível", "verdadeiro?", "mentira", "fraude", "golpe",
+    "boato", "polêmico", "assustador"
 ]
 PUNCT_SET = set("!?")
 
@@ -186,8 +203,9 @@ def embed_texts_batch(model: SentenceTransformer, texts: List[str],
 def extract_entities_simple(text: str, nlp) -> List[str]:
     """Extração simples de entidades nomeadas."""
     if nlp is None:
-        # Fallback: regex para nomes próprios
-        pattern = r'\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+){1,3})\b'
+        # Fallback: regex para nomes próprios (simples E compostos)
+        # {0,3} permite nomes simples (José) e compostos (José Silva, Jair Messias Bolsonaro)
+        pattern = r'\b([A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+(?:\s+[A-ZÁÀÂÃÉÊÍÓÔÕÚÇ][a-záàâãéêíóôõúç]+){0,3})\b'
         matches = re.findall(pattern, text)
         return list(set(matches))[:10]
 
@@ -236,8 +254,8 @@ def main():
     parser.add_argument("--random_state", type=int, default=42)
     parser.add_argument("--use_style", action="store_true",
                         help="Adicionar features de estilo")
-    parser.add_argument("--style_weight", type=float, default=0.05,
-                        help="Peso das features de estilo (0.05-0.1 recomendado)")
+    parser.add_argument("--style_weight", type=float, default=1.0,
+                        help="Peso das features de estilo (1.0 = deixar XGBoost decidir, recomendado)")
     parser.add_argument("--n_estimators", type=int, default=300,
                         help="Número de árvores no XGBoost")
     parser.add_argument("--max_depth", type=int, default=7,
@@ -322,15 +340,21 @@ def main():
         X_train_style_scaled = style_scaler.fit_transform(X_train_style)
         X_test_style_scaled = style_scaler.transform(X_test_style)
 
-        # Aplicar peso às features de estilo
-        X_train_style_weighted = X_train_style_scaled * args.style_weight
-        X_test_style_weighted = X_test_style_scaled * args.style_weight
+        # Aplicar peso às features de estilo (se style_weight=1.0, não altera nada)
+        # XGBoost baseado em árvores consegue lidar com escalas diferentes
+        if args.style_weight != 1.0:
+            X_train_style_final = X_train_style_scaled * args.style_weight
+            X_test_style_final = X_test_style_scaled * args.style_weight
+        else:
+            # Com peso 1.0, deixar XGBoost decidir importância sem artificialmente reduzir
+            X_train_style_final = X_train_style_scaled
+            X_test_style_final = X_test_style_scaled
 
         # Concatenar
         X_train = np.hstack(
-            [X_train_emb, X_train_style_weighted]).astype(np.float32)
+            [X_train_emb, X_train_style_final]).astype(np.float32)
         X_test = np.hstack(
-            [X_test_emb, X_test_style_weighted]).astype(np.float32)
+            [X_test_emb, X_test_style_final]).astype(np.float32)
 
         logger.info(f"Dimensão final: {X_train.shape[1]} features")
     else:
@@ -354,14 +378,23 @@ def main():
         gamma=0.1,
         reg_alpha=0.1,
         reg_lambda=1.0,
-        scale_pos_weight=1.0
+        scale_pos_weight=1.0,
+        # Early stopping configurado no construtor (XGBoost 2.0+)
+        early_stopping_rounds=20,
+        callbacks=None
     )
 
     # NÃO aplicar calibração - ela estava comprimindo muito as probabilidades
-    # Treinar diretamente com o XGBoost
-    logger.info("Ajustando modelo (sem calibração)...")
+    # Treinar diretamente com o XGBoost + Early Stopping
+    logger.info("Ajustando modelo (sem calibração, com early stopping)...")
     clf = base_clf
-    clf.fit(X_train, y_train_final, sample_weight=sample_weights)
+    clf.fit(
+        X_train,
+        y_train_final,
+        sample_weight=sample_weights,
+        eval_set=[(X_test, y_test)],  # Monitora o conjunto de teste
+        verbose=False
+    )
 
     # Avaliar
     logger.info("Avaliando no conjunto de teste...")
@@ -380,6 +413,31 @@ def main():
         print(f"\nAUC-ROC: {auc:.4f}")
     except Exception:
         pass
+
+    # Gerar gráfico de importância das features (Raio-X do modelo)
+    try:
+        from xgboost import plot_importance
+        import matplotlib
+        matplotlib.use('Agg')  # Backend sem GUI
+        import matplotlib.pyplot as plt
+
+        logger.info("Gerando gráfico de importância das features...")
+        plt.figure(figsize=(10, 8))
+        plot_importance(clf, max_num_features=20,
+                        height=0.5, importance_type='weight')
+        plt.title("O que a IA mais valorizou para detectar Fake News",
+                  fontsize=14, weight='bold')
+        plt.xlabel("Importância (frequência de uso nas decisões)")
+        plt.tight_layout()
+        importance_path = os.path.join(MODEL_DIR, "feature_importance.png")
+        plt.savefig(importance_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"\n📊 Gráfico de importância salvo: {importance_path}")
+        print("   → Features f0-f383: embeddings BERT")
+        if args.use_style:
+            print("   → Features f384-f391: estilo (upper_ratio, allcaps, punct, exclam, quest, avg_word_len, ttr, lex_density)")
+    except Exception as e:
+        logger.warning(f"Não foi possível gerar gráfico de importância: {e}")
 
     # Salvar artefatos
     logger.info("Salvando modelos...")

@@ -1,0 +1,8 @@
+# Dependências mínimas para treinar no Google Colab
+sentence-transformers==5.1.0
+xgboost==3.1.2
+scikit-learn==1.7.1
+numpy==2.3.2
+joblib==1.5.1
+spacy==3.8.7
+matplotlib==3.9.0
