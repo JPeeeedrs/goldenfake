@@ -4,7 +4,7 @@
   "debias": "mask",
   "style_features": true,
   "style_feature_count": 8,
-  "style_weight": 0.05,
+  "style_weight": 1.0,
   "max_seq_length": 512,
   "n_estimators": 300,
   "max_depth": 7,
