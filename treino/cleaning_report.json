@@ -1,0 +1,8 @@
+{
+  "original_size": 7200,
+  "cleaned_size": 7099,
+  "removed_too_short": 100,
+  "removed_duplicates": 1,
+  "removed_encoding": 0,
+  "total_removed": 101
+}

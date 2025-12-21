@@ -1,0 +1,73 @@
+{
+  "stats": {
+    "fields": {
+      "missing_required": {},
+      "optional_present": {
+        "title": 0,
+        "source": 0,
+        "url": 0,
+        "date": 0
+      }
+    },
+    "labels": {
+      "fake": 3600,
+      "true": 3600
+    },
+    "length": {
+      "mean_words": 643.0905555555555,
+      "median_words": 362.0,
+      "std_words": 671.0705312489906,
+      "min_words": 9,
+      "max_words": 7517,
+      "p25": 156.0,
+      "p75": 921.0
+    },
+    "duplicates": {
+      "exact": 1,
+      "exact_count": 1,
+      "near": 1,
+      "near_count": 1
+    },
+    "length_by_label": {
+      "fake": {
+        "mean": 185.88722222222222,
+        "median": 157.0,
+        "std": 127.61493317814232
+      },
+      "true": {
+        "mean": 1100.293888888889,
+        "median": 918.0,
+        "std": 682.8733181413087
+      }
+    },
+    "vocabulary": {
+      "fake_size": 33715,
+      "true_size": 80228,
+      "overlap": 28137
+    }
+  },
+  "problems": {
+    "too_short": 100,
+    "too_short_chars": 63,
+    "too_long": 0,
+    "low_diversity": 0,
+    "high_repetition": 0,
+    "empty_text": 0,
+    "encoding_issue": 0,
+    "too_many_urls": 0,
+    "exact_duplicates": 1
+  },
+  "total_samples": 7200,
+  "actions": [
+    {
+      "priority": 1,
+      "action": "Remover duplicatas exatas",
+      "code": "dataset = remove_duplicates(dataset)"
+    },
+    {
+      "priority": 2,
+      "action": "Remover textos com < 50 palavras",
+      "code": "dataset = [d for d in dataset if len(d[\"text\"].split()) >= 50]"
+    }
+  ]
+}
